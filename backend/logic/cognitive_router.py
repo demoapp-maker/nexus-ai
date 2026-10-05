@@ -1,8 +1,10 @@
-import json
 import asyncio
+import json
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel
+
 from logic.ai_service import ai_service
+from pydantic import BaseModel
+
 
 class IntentProfile(BaseModel):
     domain: str
@@ -71,7 +73,11 @@ class CognitiveRouter:
             domain = "general"
 
         ambiguity = 0.55 if any(marker in text for marker in ambiguity_markers) else 0.35
-        complexity = 0.7 if domain in {"architecture", "governance"} else (0.5 if domain == "investment" else 0.45)
+        complexity = (
+            0.7
+            if domain in {"architecture", "governance"}
+            else (0.5 if domain == "investment" else (0.3 if domain == "factual" else 0.45))
+        )
         strategic_impact = 0.72 if domain in {"strategic_marketing", "governance"} else (0.65 if domain == "investment" else 0.45)
         operational_impact = 0.7 if domain == "operations" else 0.45
         governance_relevance = 0.78 if domain == "governance" else 0.35
@@ -146,7 +152,9 @@ class CognitiveRouter:
 
         return coerced
         
-    async def analyze_intent(self, message: str, history: List[Dict] = []) -> IntentProfile:
+    async def analyze_intent(
+        self, message: str, history: Optional[List[Dict]] = None
+    ) -> IntentProfile:
         """
         Analyze the user's message to determine the cognitive profile and routing.
         Uses a fallback chain to ensure analysis succeeds even if the primary model fails.
@@ -253,10 +261,33 @@ Return ONLY a JSON object."""
                 print(f"[COGNITIVE-ROUTER] Attempt with {model} failed: {e}")
                 continue
 
-        # Ultimate fallback if everything fails
-        fallback = self._default_profile_data()
+        # Deterministic fallback: preserve the local intent signals instead of
+        # routing every provider outage to an unrelated generic profile.
+        fallback = {
+            **self._default_profile_data(),
+            **self._heuristic_features(message),
+        }
+        domain = fallback.get("domain")
+        fallback["suggested_mode"] = {
+            "factual": "factual_mode",
+            "educational": "educational_mode",
+            "investment": "investment_mode",
+            "architecture": "systems_mode",
+            "governance": "diagnosis_mode",
+            "operations": "diagnosis_mode",
+            "strategic_marketing": "strategic_mode",
+        }.get(domain, "factual_mode")
+        fallback["suggested_model"] = {
+            "architecture": "qwen/qwen3-coder:free",
+            "investment": "google/gemma-4-31b-it:free",
+            "strategic_marketing": "google/gemma-4-31b-it:free",
+        }.get(domain, self.intent_model)
+        fallback = self._compute_derived_scores(fallback)
         fallback["confidence"] = 0.1
-        fallback["reasoning_rationale"] = "Analysis failed across all models, using default."
+        fallback["reasoning_rationale"] = (
+            "Model analysis failed; deterministic heuristic fallback used."
+        )
+        fallback = self._coerce_profile_data(fallback)
         return IntentProfile(**fallback)
 
     def get_system_prompt_for_mode(self, mode: str, profile: IntentProfile) -> str:

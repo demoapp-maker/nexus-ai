@@ -18,6 +18,12 @@ frontend.log
 dist/
 build/
 .next/
+.turbo/
+*.tsbuildinfo
+
+# Local runtime data
+backend/data/
+data/
 
 # Python
 __pycache__/

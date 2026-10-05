@@ -1,10 +1,10 @@
 import json
+import os
 import time
-from typing import List
 
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
 
 def extract_mode_from_stream(message: str) -> str:

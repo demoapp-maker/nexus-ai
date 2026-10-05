@@ -1,16 +1,14 @@
-import json
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-from sqlalchemy import text
+from typing import Any, Dict
 
 from config.database import AIProviderConfig, SessionLocal, engine
 from logic import simple_memory
 from logic.routing_metrics import routing_metrics
+from logic.secrets import SecretConfigError, decrypt_secret, encrypt_secret
+from sqlalchemy import text
 
 
 def _normalize_base_url(provider: str, base_url: str) -> str:
@@ -39,7 +37,7 @@ def _default_runtime_config() -> Dict[str, Any]:
         title = os.getenv("ALIBABA_AI_TITLE", "Nexus AI")
     elif provider == "duckai":
         base_url = os.getenv("DUCKAI_URL", "http://localhost:3000/v1")
-        api_key = os.getenv("DUCKAI_API_KEY", "dummy-key")
+        api_key = os.getenv("DUCKAI_API_KEY", "")
         model = os.getenv("DUCKAI_MODEL", "gpt-4o-mini")
         referer = os.getenv("DUCKAI_REFERER", "")
         title = os.getenv("DUCKAI_TITLE", "Nexus AI")
@@ -72,10 +70,18 @@ def _row_to_config(row: AIProviderConfig) -> Dict[str, Any]:
     if not isinstance(fallback_models, list):
         fallback_models = []
 
+    try:
+        stored_api_key = decrypt_secret(row.api_key or "")
+    except SecretConfigError:
+        # Keep health/config endpoints usable while making the provider appear
+        # unconfigured until the encryption key is supplied.
+        stored_api_key = ""
+    env_api_key = str(_default_runtime_config().get("api_key") or "")
+
     return {
         "provider": row.provider,
         "base_url": _normalize_base_url(row.provider, row.base_url),
-        "api_key": row.api_key or "",
+        "api_key": stored_api_key or env_api_key,
         "model": row.model,
         "fallback_models": fallback_models,
         "referer": row.referer or "",
@@ -97,7 +103,9 @@ def ensure_default_ai_config() -> Dict[str, Any]:
         config = AIProviderConfig(
             provider=defaults["provider"],
             base_url=defaults["base_url"],
-            api_key=defaults["api_key"],
+            # Environment keys are read at runtime; database-managed keys are
+            # encrypted only through update_ai_config().
+            api_key="",
             model=defaults["model"],
             fallback_models=defaults["fallback_models"],
             referer=defaults["referer"],
@@ -140,9 +148,15 @@ def update_ai_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(fallback_models, list):
             fallback_models = []
 
+        previous_provider = row.provider if row.id is not None else None
         row.provider = provider
         row.base_url = base_url
-        row.api_key = str(payload.get("api_key") or "")
+        if "api_key" in payload and payload.get("api_key") is not None:
+            submitted_key = str(payload.get("api_key") or "")
+            row.api_key = encrypt_secret(submitted_key) if submitted_key else ""
+        elif previous_provider and previous_provider != provider:
+            # Never accidentally send a key for provider A to provider B.
+            row.api_key = ""
         row.model = str(payload.get("model") or "openrouter/free")
         row.fallback_models = fallback_models
         row.referer = str(payload.get("referer") or "")
@@ -247,7 +261,7 @@ def build_admin_health_snapshot(started_at: datetime) -> Dict[str, Any]:
     return {
         "app": {
             "status": "healthy",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "started_at": started_at.isoformat(),
             "uptime_seconds": round((datetime.utcnow() - started_at).total_seconds(), 2),
         },

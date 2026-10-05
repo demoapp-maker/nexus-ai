@@ -63,7 +63,7 @@ Jika ingin menambah mode baru:
 - Semua perubahan routing wajib punya jejak observability.
 
 ### Frontend
-- Wajib lolos eslint.
+- Wajib lolos `npm run lint` dan `npm run typecheck`.
 - Patuhi strict react-hooks rules:
 - set-state-in-effect
 - immutability
@@ -71,17 +71,20 @@ Jika ingin menambah mode baru:
 - refs
 - Hindari mutable local accumulator di component handler.
 - Hindari generic any pada payload streaming.
+- Browser memakai URL relatif `/api/...`; URL backend hanya boleh digunakan oleh server-side proxy.
 
 ## 5) Definition of done untuk perubahan agent
-Sebelum dianggap selesai, jalankan:
-1. Restart service
-- /root/nexus-ai/nexus.sh restart
-2. Smoke test routing lama
-- python3 /root/nexus-ai/test_nexus_routing.py
-3. Matrix test routing kognitif
-- python3 /root/nexus-ai/test_cognitive_routing_matrix.py
-4. Lint frontend minimal file yang diubah
-- cd /root/nexus-ai/frontend && npx eslint src/components/ChatInterface.tsx src/app/api/chat/stream/route.ts
+Sebelum dianggap selesai, jalankan dari repository root:
+1. Backend unit/security tests
+- pytest -q
+2. Static checks
+- ruff check backend
+3. Frontend quality gate
+- cd frontend && npm run lint && npm run typecheck && npm run build
+4. Smoke test end-to-end dengan backend aktif
+- ./test_nexus_tools.sh
+- python3 test_nexus_routing.py
+- python3 test_cognitive_routing_matrix.py
 
 Jika salah satu gagal, jangan merge.
 

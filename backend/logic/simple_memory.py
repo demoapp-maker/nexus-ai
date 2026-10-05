@@ -1,143 +1,167 @@
+"""Lightweight episodic memory backed by SQLite.
+
+The database path is absolute and configurable so the result does not depend on
+which directory starts Uvicorn/PM2. The memory store is intentionally simple;
+production deployments can replace this module with a shared vector store while
+keeping the MemoryManager interface.
 """
-Simple Memory System for Nexus AI - Lightweight Alternative to MIRA
-Uses SQLite for storage and keyword-based search (no heavy embeddings)
-"""
-import sqlite3
+
+from __future__ import annotations
+
 import json
 import os
-from datetime import datetime
-from typing import List, Dict, Optional
+import sqlite3
+from pathlib import Path
+from typing import Dict, List, Optional
 
-DB_PATH = "data/nexus_memory.db"
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+_default_db = BACKEND_ROOT / "data" / "nexus_memory.db"
+_configured_db = os.getenv("NEXUS_MEMORY_DB", "").strip()
+if _configured_db:
+    _configured_path = Path(_configured_db)
+    DB_PATH = str(
+        (_configured_path if _configured_path.is_absolute() else BACKEND_ROOT / _configured_path).resolve()
+    )
+else:
+    DB_PATH = str(_default_db)
 
-def init_db():
-    """Initialize SQLite database for memory storage"""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Create tables
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room TEXT NOT NULL,
-            content TEXT NOT NULL,
-            memory_type TEXT DEFAULT 'fact',
-            tags TEXT,  -- JSON array
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            accessed_count INTEGER DEFAULT 0
+
+def _connect() -> sqlite3.Connection:
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def init_db() -> None:
+    """Initialize SQLite database for memory storage."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room TEXT NOT NULL,
+                content TEXT NOT NULL,
+                memory_type TEXT DEFAULT 'fact',
+                tags TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                accessed_count INTEGER DEFAULT 0
+            )
+            """
         )
-    ''')
-    
-    # Create index for faster searches
-    c.execute('CREATE INDEX IF NOT EXISTS idx_room ON memories(room)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at)')
-    
-    conn.commit()
-    conn.close()
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_room ON memories(room)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at)")
+        conn.commit()
 
-def store_memory(content: str, room: str = "general", memory_type: str = "fact",
-                 tags: List[str] = None):
-    """Store a memory entry"""
+
+def store_memory(
+    content: str,
+    room: str = "general",
+    memory_type: str = "fact",
+    tags: Optional[List[str]] = None,
+) -> None:
+    """Store one memory entry."""
+    if not content:
+        return
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    tags_json = json.dumps(tags) if tags else json.dumps([])
-    
-    c.execute('''
-        INSERT INTO memories (room, content, memory_type, tags)
-        VALUES (?, ?, ?, ?)
-    ''', (room, content, memory_type, tags_json))
-    
-    conn.commit()
-    conn.close()
-    print(f"💾 Memory stored in room: {room}")
+    tags_json = json.dumps(tags or [], ensure_ascii=False)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memories (room, content, memory_type, tags)
+            VALUES (?, ?, ?, ?)
+            """,
+            (room, content, memory_type, tags_json),
+        )
+        conn.commit()
 
-def recall_memory(query: str, room: str = "general", budget: int = 3000,
-                  limit: int = 5) -> str:
-    """
-    Recall memories using keyword-based search
-    Returns formatted context string
-    """
+
+def recall_memory(
+    query: str,
+    room: str = "general",
+    budget: int = 3000,
+    limit: int = 5,
+) -> str:
+    """Recall keyword-matching memories and return bounded context."""
     if not query:
         return ""
-        
+
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    # Build search terms from query (longer words only)
-    search_terms = [t.lower() for t in query.split() if len(t) > 2]
-    
-    # Search with LIKE for each term
+    limit = max(1, min(int(limit), 20))
+    budget = max(100, min(int(budget), 20_000))
+    search_terms = [term.lower() for term in query.split() if len(term) > 2]
+
     conditions = []
-    params = [room]
-    
+    params: List[object] = [room]
     for term in search_terms:
-        conditions.append("content LIKE ?")
-        params.append(f'%{term}%')
-    
+        # Escape LIKE wildcards so a user cannot turn a term into a full scan.
+        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conditions.append("content LIKE ? ESCAPE '\\'")
+        params.append(f"%{escaped}%")
+
     where_clause = " OR ".join(conditions) if conditions else "1=1"
-    
-    query_sql = f'''
-        SELECT * FROM memories
-        WHERE room = ?
-        AND ({where_clause})
-        ORDER BY accessed_count DESC, created_at DESC
-        LIMIT ?
-    '''
-    
     params.append(limit)
-    c.execute(query_sql, params)
-    rows = c.fetchall()
-    
-    # Format results
-    if not rows:
-        # Fallback: get last 2 messages from this room if no keyword match
-        c.execute('SELECT * FROM memories WHERE room = ? ORDER BY created_at DESC LIMIT 2', (room,))
-        rows = c.fetchall()
+
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE room = ? AND ({where_clause})
+            ORDER BY accessed_count DESC, created_at DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
         if not rows:
-            conn.close()
+            rows = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE room = ?
+                ORDER BY created_at DESC
+                LIMIT 2
+                """,
+                (room,),
+            ).fetchall()
+
+        if not rows:
             return ""
-    
-    result_parts = []
-    total_tokens = 0
-    
-    for row in rows:
-        # Update access count
-        c.execute('UPDATE memories SET accessed_count = accessed_count + 1 WHERE id = ?', 
-                 (row['id'],))
-        
-        content = row['content']
-        token_estimate = len(content) // 4  # Rough estimate
-        
-        if total_tokens + token_estimate > budget:
-            break
-            
-        result_parts.append(f"[Memori {row['created_at']}]: {content}")
-        total_tokens += token_estimate
-    
-    conn.commit()
-    conn.close()
-    
-    return "\n\n".join(result_parts)
+
+        result_parts: List[str] = []
+        total_tokens = 0
+        selected_ids: List[int] = []
+        for row in rows:
+            content = str(row["content"])
+            token_estimate = max(1, len(content) // 4)
+            if total_tokens + token_estimate > budget:
+                break
+            result_parts.append(f"[Memori {row['created_at']}]: {content}")
+            total_tokens += token_estimate
+            selected_ids.append(int(row["id"]))
+
+        if selected_ids:
+            conn.executemany(
+                "UPDATE memories SET accessed_count = accessed_count + 1 WHERE id = ?",
+                [(memory_id,) for memory_id in selected_ids],
+            )
+            conn.commit()
+
+        return "\n\n".join(result_parts)
+
 
 def list_memories(room: str = "general") -> List[Dict]:
-    """List all memories in a room"""
+    """List metadata for memories in a room."""
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    c.execute('''
-        SELECT id, room, memory_type, tags, created_at, accessed_count
-        FROM memories
-        WHERE room = ?
-        ORDER BY created_at DESC
-    ''', (room,))
-    
-    rows = [dict(row) for row in c.fetchall()]
-    conn.close()
-    return rows
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, room, memory_type, tags, created_at, accessed_count
+            FROM memories
+            WHERE room = ?
+            ORDER BY created_at DESC
+            """,
+            (room,),
+        ).fetchall()
+        return [dict(row) for row in rows]

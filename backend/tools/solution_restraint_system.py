@@ -18,11 +18,10 @@ This module implements:
 5. TGM-Aware Restraint Logic
 """
 
-from typing import Dict, List, Optional, Tuple
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-import math
-import re
+from typing import Dict, List, Optional, Tuple
 
 
 class DiagnosisDimension(Enum):
@@ -515,7 +514,7 @@ class SolutionRestraintSystem:
                 gaps.append(f"- **{dim.value.replace('_', ' ').title()}**: Cukup jelas tapi butuh validasi lebih (clarity: {score:.0%})")
         
         if gaps:
-            return f"\n\n**Gap diagnosis yang masih ada:**\n" + "\n".join(gaps)
+            return "\n\n**Gap diagnosis yang masih ada:**\n" + "\n".join(gaps)
         
         return ""
 

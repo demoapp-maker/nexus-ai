@@ -1,6 +1,8 @@
 import asyncio
-from tools.web_search_tool import web_search_tool
 import json
+
+from tools.web_search_tool import web_search_tool
+
 
 async def test_search():
     print("Testing Web Search Tool...")

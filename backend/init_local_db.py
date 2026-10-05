@@ -1,9 +1,11 @@
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config.database import init_db, engine
+from config.database import engine, init_db
 from sqlalchemy import text
+
 
 def setup():
     print("🚀 Initializing Local PostgreSQL for Nexus AI...")
@@ -20,6 +22,7 @@ def setup():
             
     except Exception as e:
         print(f"❌ Setup failed: {e}")
+        raise SystemExit(1) from e
 
 if __name__ == "__main__":
     setup()

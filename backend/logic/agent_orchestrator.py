@@ -1,15 +1,43 @@
+from __future__ import annotations
+
 import asyncio
 import json
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
+
 from logic.ai_service import ai_service
+from logic.memory_manager import memory_manager
+
 
 class AgentOrchestrator:
-    def __init__(self):
-        self.max_iterations = 10
+    """Bounded research and planning workflows built on the shared AI service."""
+
+    def __init__(self) -> None:
+        self.max_iterations = 6
         self.tools = self._get_available_tools()
-    
-    def _get_available_tools(self) -> List[Dict]:
-        """Define available tools for the agent"""
+
+    def _planner_model(self) -> str:
+        config = ai_service._load_runtime_config()
+        configured = str(config.get("model") or "openrouter/free")
+        if configured in {"", "openrouter/free"}:
+            return ai_service.get_fallback_chain("openrouter/free")[0]
+        return configured
+
+    @staticmethod
+    def _parse_json_object(value: Optional[str], fallback: Dict[str, Any]) -> Dict[str, Any]:
+        if not value:
+            return fallback
+        cleaned = value.strip()
+        if "```" in cleaned:
+            parts = cleaned.split("```")
+            cleaned = parts[1] if len(parts) > 1 else cleaned
+            cleaned = cleaned.removeprefix("json").strip()
+        try:
+            parsed = json.loads(cleaned)
+            return parsed if isinstance(parsed, dict) else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    def _get_available_tools(self) -> List[Dict[str, Any]]:
         return [
             {
                 "type": "function",
@@ -19,236 +47,174 @@ class AgentOrchestrator:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search query"
-                            },
-                            "num_results": {
-                                "type": "number",
-                                "description": "Number of results to return (default: 5)"
-                            }
+                            "query": {"type": "string", "maxLength": 500},
+                            "num_results": {"type": "integer", "minimum": 1, "maximum": 10},
                         },
-                        "required": ["query"]
-                    }
-                }
+                        "required": ["query"],
+                    },
+                },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "research_topic",
-                    "description": "Perform in-depth research on a topic with multiple searches",
+                    "description": "Perform bounded research on a topic",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "topic": {
-                                "type": "string",
-                                "description": "The topic to research"
-                            },
-                            "depth": {
-                                "type": "string",
-                                "enum": ["shallow", "deep"],
-                                "description": "Research depth level"
-                            }
+                            "topic": {"type": "string", "maxLength": 500},
+                            "depth": {"type": "string", "enum": ["shallow", "deep"]},
                         },
-                        "required": ["topic"]
-                    }
-                }
-            }
+                        "required": ["topic"],
+                    },
+                },
+            },
         ]
-    
-    async def autonomous_research(self, query: str, session_id: str = "default") -> Dict:
-        """
-        Autonomous research workflow:
-        1. Plan research approach
-        2. Execute searches
-        3. Synthesize findings
-        4. Generate final report
-        """
-        
-        print(f"🔍 Starting autonomous research on: {query}")
-        
-        # Step 1: Create research plan
-        plan_prompt = f"""
-You are a research planner. Create a step-by-step plan to research: "{query}"
 
-Return a JSON object with:
-- objectives: List of research objectives
-- search_queries: List of specific search queries to execute
-- expected_outcomes: What we hope to learn
-
-Format: {{"objectives": [...], "search_queries": [...], "expected_outcomes": [...]}}
-"""
-        
-        plan_response = await asyncio.to_thread(
+    async def _call_model(self, prompt: str, system_prompt: str) -> Optional[str]:
+        return await asyncio.to_thread(
             ai_service.call_ai,
-            plan_prompt,
-            system_prompt="You are an expert research planner.",
-            model="google/gemini-2.0-flash-001"
+            prompt,
+            system_prompt=system_prompt,
+            model=self._planner_model(),
         )
-        
-        try:
-            plan = json.loads(plan_response) if plan_response else {}
-        except:
-            plan = {
+
+    async def autonomous_research(
+        self, query: str, session_id: str = "default"
+    ) -> Dict[str, Any]:
+        query = query.strip()[:2_000]
+        if not query:
+            return {"error": "Research query cannot be empty"}
+
+        plan_prompt = f"""
+You are a research planner. Create a bounded plan to research: {query!r}
+Return JSON with objectives, search_queries, and expected_outcomes.
+Use no more than five search queries.
+"""
+        plan = self._parse_json_object(
+            await self._call_model(plan_prompt, "You are an expert research planner."),
+            {
                 "objectives": [f"Research {query}"],
                 "search_queries": [query],
-                "expected_outcomes": ["Comprehensive understanding"]
-            }
-        
-        print(f"📋 Research plan created: {len(plan.get('search_queries', []))} queries planned")
-        
-        # Step 2: Execute research iterations
-        findings = []
-        iteration = 0
-        
-        for iteration in range(self.max_iterations):
-            print(f"🔄 Iteration {iteration + 1}/{self.max_iterations}")
-            
-            # Decide next action
-            action_prompt = f"""
-Based on the research plan and findings so far, what should we do next?
-
-Plan: {json.dumps(plan)}
-Findings so far: {json.dumps(findings[-3:]) if findings else "None yet"}
-
-Choose one:
-1. Call web_search with a specific query
-2. Call research_topic for deep dive
-3. Summarize findings and complete research
-
-Return JSON: {{"action": "search|research|complete", "parameters": {{...}}, "reasoning": "..."}}
-"""
-            
-            action_response = await asyncio.to_thread(
-                ai_service.call_ai,
-                action_prompt,
-                system_prompt="You are a research executor. Decide the next best action.",
-                model="google/gemini-2.0-flash-001"
-            )
-            
-            try:
-                action = json.loads(action_response) if action_response else {"action": "complete"}
-            except:
-                action = {"action": "complete", "parameters": {}, "reasoning": "Parsing error"}
-            
-            print(f"   Action: {action.get('action', 'unknown')}")
-            
-            if action["action"] == "complete" or iteration == self.max_iterations - 1:
-                print("✅ Research complete")
-                break
-            
-            # Execute the chosen action
-            if action["action"] == "search":
-                query_text = action['parameters'].get('query', query)
-                print(f"   🔎 Searching: {query_text}")
-                
-                result = await asyncio.to_thread(
-                    ai_service.call_ai,
-                    f"Search for: {query_text}",
-                    tools=self.tools,
-                    tool_choice={"type": "function", "function": {"name": "web_search"}},
-                    model="google/gemini-2.0-flash-001"
-                )
-                
-                findings.append({
-                    "iteration": iteration,
-                    "action": "search",
-                    "query": query_text,
-                    "result": result
-                })
-            
-            elif action["action"] == "research":
-                topic = action['parameters'].get('topic', query)
-                depth = action['parameters'].get('depth', 'shallow')
-                print(f"   📚 Researching: {topic} ({depth})")
-                
-                result = await asyncio.to_thread(
-                    ai_service.call_ai,
-                    f"Research topic: {topic}",
-                    tools=self.tools,
-                    tool_choice={"type": "function", "function": {"name": "research_topic"}},
-                    model="google/gemini-2.0-flash-001"
-                )
-                
-                findings.append({
-                    "iteration": iteration,
-                    "action": "research",
-                    "topic": topic,
-                    "depth": depth,
-                    "result": result
-                })
-        
-        # Step 3: Synthesize final report
-        print("📝 Synthesizing final report...")
-        synthesis_prompt = f"""
-Synthesize all research findings into a comprehensive report on: "{query}"
-
-Research Plan: {json.dumps(plan)}
-All Findings: {json.dumps(findings)}
-
-Create a well-structured report with:
-1. Executive Summary
-2. Key Findings
-3. Detailed Analysis
-4. Sources Referenced
-5. Recommendations (if applicable)
-"""
-        
-        final_report = await asyncio.to_thread(
-            ai_service.call_ai,
-            synthesis_prompt,
-            system_prompt="You are an expert researcher creating a comprehensive report.",
-            model="google/gemini-2.0-flash-001"
+                "expected_outcomes": ["A source-backed summary"],
+            },
         )
-        
-        print("✅ Research completed successfully!")
-        
+        plan["search_queries"] = [
+            str(item)[:500] for item in (plan.get("search_queries") or [query])[:5]
+        ]
+
+        findings: List[Dict[str, Any]] = []
+        iterations_used = 0
+        for iteration in range(self.max_iterations):
+            iterations_used = iteration + 1
+            action_prompt = f"""
+Based on this plan and the latest findings, choose the next action.
+Plan: {json.dumps(plan, ensure_ascii=False)}
+Findings: {json.dumps(findings[-3:], ensure_ascii=False)}
+Return JSON: {{"action":"search|research|complete", "parameters":{{}}}}
+"""
+            action = self._parse_json_object(
+                await self._call_model(
+                    action_prompt,
+                    "You are a bounded research executor. Return only JSON.",
+                ),
+                {"action": "complete", "parameters": {}},
+            )
+            action_name = str(action.get("action") or "complete").lower()
+            parameters = action.get("parameters")
+            if not isinstance(parameters, dict):
+                parameters = {}
+
+            if action_name == "complete":
+                break
+            if action_name == "search":
+                try:
+                    num_results = max(1, min(int(parameters.get("num_results", 5)), 10))
+                except (TypeError, ValueError):
+                    num_results = 5
+                tool_call = {
+                    "function": {
+                        "name": "web_search",
+                        "arguments": json.dumps(
+                            {
+                                "query": str(parameters.get("query") or query)[:500],
+                                "num_results": num_results,
+                            }
+                        ),
+                    }
+                }
+                result = await ai_service.execute_tool_call(tool_call)
+                findings.append(
+                    {
+                        "iteration": iteration,
+                        "action": "search",
+                        "query": parameters.get("query") or query,
+                        "result": result,
+                    }
+                )
+            elif action_name == "research":
+                tool_call = {
+                    "function": {
+                        "name": "research_topic",
+                        "arguments": json.dumps(
+                            {
+                                "topic": str(parameters.get("topic") or query)[:500],
+                                "depth": str(parameters.get("depth") or "shallow"),
+                            }
+                        ),
+                    }
+                }
+                result = await ai_service.execute_tool_call(tool_call)
+                findings.append(
+                    {
+                        "iteration": iteration,
+                        "action": "research",
+                        "topic": parameters.get("topic") or query,
+                        "result": result,
+                    }
+                )
+            else:
+                break
+
+        synthesis_prompt = f"""
+Create a concise source-backed report about {query!r}.
+Plan: {json.dumps(plan, ensure_ascii=False)}
+Findings: {json.dumps(findings, ensure_ascii=False)}
+Include executive summary, key findings, caveats, and source URLs.
+"""
+        final_report = await self._call_model(
+            synthesis_prompt,
+            "You are an expert researcher. Do not invent sources.",
+        )
+        final_report = final_report or "Research completed but synthesis was unavailable."
+        memory_manager.mira_store(
+            f"[research]\nQuery: {query}\nReport: {final_report[:20_000]}",
+            room=memory_manager.session_room(session_id),
+        )
         return {
             "query": query,
             "plan": plan,
             "findings": findings,
             "final_report": final_report,
-            "iterations_used": iteration + 1
+            "iterations_used": iterations_used,
         }
-    
-    async def task_planning(self, goal: str) -> Dict:
-        """
-        Autonomous task planning:
-        Break down complex goals into executable steps
-        """
-        
-        print(f"📋 Creating task plan for: {goal}")
-        
+
+    async def task_planning(self, goal: str) -> Dict[str, Any]:
+        goal = goal.strip()[:2_000]
+        if not goal:
+            return {"error": "Task goal cannot be empty"}
         planning_prompt = f"""
 Goal: {goal}
-
-Create a detailed execution plan with:
-1. Task breakdown into sequential steps
-2. Required resources/tools for each step
-3. Success criteria
-4. Potential obstacles and mitigation
-
-Return JSON format:
-{{
-    "steps": [
-        {{"step_number": 1, "action": "...", "tool_needed": "...", "success_criteria": "..."}}
-    ],
-    "resources_needed": [...],
-    "risks": [...]
-}}
+Return JSON with steps, resources_needed, and risks.
+Each step must contain step_number, action, tool_needed, and success_criteria.
 """
-        
-        plan = await asyncio.to_thread(
-            ai_service.call_ai,
-            planning_prompt,
-            system_prompt="You are an expert task planner. Create actionable, detailed plans.",
-            model="google/gemini-2.0-flash-001"
+        parsed = self._parse_json_object(
+            await self._call_model(
+                planning_prompt,
+                "You are an expert task planner. Return only JSON.",
+            ),
+            {},
         )
-        
-        try:
-            parsed_plan = json.loads(plan) if plan else {}
-            print(f"✅ Task plan created with {len(parsed_plan.get('steps', []))} steps")
-            return parsed_plan
-        except:
-            print("⚠️ Failed to parse plan, returning raw response")
-            return {"error": "Failed to parse plan", "raw_response": plan}
+        if not parsed:
+            return {"error": "Failed to parse task plan"}
+        return parsed

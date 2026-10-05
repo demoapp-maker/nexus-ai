@@ -1,35 +1,45 @@
-import os
-import asyncio
-import requests
-import json
-import time
-import httpx
-from typing import Optional, List, Dict, Tuple
+from __future__ import annotations
 
+import ast
+import asyncio
+import json
+import operator
+import os
+import time
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+import httpx
+import requests
 from logic.admin_settings import get_active_ai_config, get_provider_headers
 
-# ----- Free model cache (module-level, shared across requests) -----
 _free_models_cache: List[str] = []
 _free_models_fetched_at: float = 0.0
-_FREE_MODELS_TTL = 600  # refresh every 10 minutes
+_FREE_MODELS_TTL = 600
+
 
 class AIService:
-    def __init__(self):
-        self.provider = os.getenv("DEFAULT_AI_PROVIDER", "openrouter")
-
-        # DuckAI Config
-        self.duckai_url = os.getenv("DUCKAI_URL", "http://localhost:3000/v1/chat/completions")
-        self.duckai_api_key = os.getenv("DUCKAI_API_KEY", "dummy-key")
-
-        # OpenRouter Config
-        self.openrouter_url = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+    def __init__(self) -> None:
+        self.provider = os.getenv("DEFAULT_AI_PROVIDER", "openrouter").strip().lower()
+        self.duckai_url = os.getenv(
+            "DUCKAI_URL", "http://localhost:3000/v1/chat/completions"
+        )
+        self.duckai_api_key = os.getenv("DUCKAI_API_KEY", "")
+        self.openrouter_url = os.getenv(
+            "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
+        )
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
-
-        # Alibaba-compatible OpenAI endpoint
-        self.alibaba_url = os.getenv("ALIBABA_AI_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions")
-        self.alibaba_api_key = os.getenv("ALIBABA_AI_KEY", os.getenv("ALIBABA_API_KEY", ""))
-
-        # Hardcoded reliable free fallbacks (used if API fetch fails)
+        self.alibaba_url = os.getenv(
+            "ALIBABA_AI_URL",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+        )
+        self.alibaba_api_key = os.getenv(
+            "ALIBABA_AI_KEY", os.getenv("ALIBABA_API_KEY", "")
+        )
+        self.mock_mode = os.getenv("NEXUS_MOCK_AI", "false").lower() in {
+            "1", "true", "yes"
+        }
         self._default_free_models = [
             "google/gemma-4-31b-it:free",
             "google/gemma-4-26b-a4b-it:free",
@@ -48,463 +58,578 @@ class AIService:
             if config:
                 return config
         except Exception as exc:
-            print(f"[AI-CONFIG] Falling back to env config: {exc}")
+            print(f"[AI-CONFIG] Falling back to environment config: {exc}")
+
+        if self.provider == "alibaba":
+            base_url = self.alibaba_url
+            api_key = self.alibaba_api_key
+            model = os.getenv("ALIBABA_AI_MODEL", "qwen-plus")
+        elif self.provider == "duckai":
+            base_url = self.duckai_url
+            api_key = self.duckai_api_key
+            model = os.getenv("DUCKAI_MODEL", "gpt-4o-mini")
+        else:
+            base_url = self.openrouter_url
+            api_key = self.openrouter_api_key
+            model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
         return {
             "provider": self.provider,
-            "base_url": self.openrouter_url if self.provider == "openrouter" else self.alibaba_url,
-            "api_key": self.openrouter_api_key if self.provider == "openrouter" else self.alibaba_api_key,
-            "model": os.getenv("DEFAULT_AI_MODEL", "openrouter/free"),
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
             "fallback_models": [],
-            "referer": "https://nexus-ai.local",
-            "title": "Nexus AI",
+            "referer": os.getenv("OPENROUTER_REFERER", "http://localhost:5008"),
+            "title": os.getenv("OPENROUTER_TITLE", "Nexus AI"),
             "extra_headers": {},
             "source": "environment",
         }
 
-    def _get_config(self, runtime_config: Optional[Dict[str, object]] = None):
+    def _get_config(
+        self, runtime_config: Optional[Dict[str, object]] = None
+    ) -> Tuple[str, str, str, Dict[str, str]]:
         config = runtime_config or self._load_runtime_config()
-        provider = str(config.get("provider") or self.provider)
-
+        provider = str(config.get("provider") or self.provider).strip().lower()
         if provider == "openrouter":
-            return (
-                str(config.get("base_url") or self.openrouter_url),
-                str(config.get("api_key") or self.openrouter_api_key),
-                provider,
-                get_provider_headers(config),
-            )
+            default_url, default_key = self.openrouter_url, self.openrouter_api_key
+        elif provider == "alibaba":
+            default_url, default_key = self.alibaba_url, self.alibaba_api_key
+        elif provider == "duckai":
+            default_url, default_key = self.duckai_url, self.duckai_api_key
+        else:
+            default_url, default_key = self.openrouter_url, self.openrouter_api_key
 
-        if provider == "alibaba":
-            return (
-                str(config.get("base_url") or self.alibaba_url),
-                str(config.get("api_key") or self.alibaba_api_key),
-                provider,
-                get_provider_headers(config),
-            )
-
-        if provider == "duckai":
-            return (
-                str(config.get("base_url") or self.duckai_url),
-                str(config.get("api_key") or self.duckai_api_key),
-                provider,
-                get_provider_headers(config),
-            )
-
-        return (
-            str(config.get("base_url") or self.openrouter_url),
-            str(config.get("api_key") or self.openrouter_api_key),
-            provider,
-            get_provider_headers(config),
-        )
+        url = str(config.get("base_url") or default_url)
+        api_key = str(config.get("api_key") or default_key)
+        headers = dict(get_provider_headers(config))
+        headers["Authorization"] = f"Bearer {api_key}"
+        return url, api_key, provider, headers
 
     def fetch_free_models(self) -> List[str]:
-        """Fetch & cache the list of free models from OpenRouter API.
-        Models are considered free if prompt pricing == '0' OR id ends with ':free'.
-        Cache is refreshed every FREE_MODELS_TTL seconds.
-        """
+        """Fetch and cache OpenRouter models with zero prompt/completion cost."""
         global _free_models_cache, _free_models_fetched_at
-
         runtime_config = self._load_runtime_config()
-        provider = str(runtime_config.get("provider") or self.provider)
+        provider = str(runtime_config.get("provider") or self.provider).lower()
         api_key = str(runtime_config.get("api_key") or self.openrouter_api_key)
-
         now = time.time()
-        if _free_models_cache and (now - _free_models_fetched_at) < _FREE_MODELS_TTL:
-            return _free_models_cache
-
+        if _free_models_cache and now - _free_models_fetched_at < _FREE_MODELS_TTL:
+            return list(_free_models_cache)
         if provider != "openrouter":
-            return self._default_free_models
+            return list(self._default_free_models)
 
         try:
-            print("[FREE-ROUTER] Fetching free models from OpenRouter API...")
-            resp = requests.get(
+            response = requests.get(
                 "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=10
+                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                timeout=10,
             )
-            if resp.status_code == 200:
-                data = resp.json().get("data", [])
-                free = []
-                for m in data:
-                    model_id = m.get("id", "")
-                    prompt_price = str(m.get("pricing", {}).get("prompt", "1"))
-                    completion_price = str(m.get("pricing", {}).get("completion", "1"))
-                    ctx = m.get("context_length", 0)
-
-                    is_free = (
-                        model_id.endswith(":free") or
-                        (prompt_price == "0" and completion_price == "0")
-                    )
-                    # Filter out experimental/low-quality models
-                    is_usable = ctx >= 8192 and "ocr" not in model_id and "vision-ocr" not in model_id
-
-                    if is_free and is_usable:
-                        free.append(model_id)
-
-                if free:
-                    _free_models_cache = free
-                    _free_models_fetched_at = now
-                    print(f"[FREE-ROUTER] Found {len(free)} free models: {free[:5]}...")
-                    return free
-        except Exception as e:
-            print(f"[FREE-ROUTER] Failed to fetch free models: {e}")
-
-        # Fallback to defaults
-        return self._default_free_models
+            response.raise_for_status()
+            free: List[str] = []
+            for model in response.json().get("data", []):
+                model_id = str(model.get("id") or "")
+                pricing = model.get("pricing") or {}
+                prompt_price = str(pricing.get("prompt", "1"))
+                completion_price = str(pricing.get("completion", "1"))
+                context_length = int(model.get("context_length") or 0)
+                is_free = model_id.endswith(":free") or (
+                    prompt_price == "0" and completion_price == "0"
+                )
+                is_usable = context_length >= 8192 and "ocr" not in model_id
+                if model_id and is_free and is_usable:
+                    free.append(model_id)
+            if free:
+                _free_models_cache = list(dict.fromkeys(free))
+                _free_models_fetched_at = now
+                return list(_free_models_cache)
+        except Exception as exc:
+            print(f"[FREE-ROUTER] Failed to fetch free models: {exc}")
+        return list(self._default_free_models)
 
     async def fetch_free_models_async(self) -> List[str]:
-        """Async wrapper to fetch free models without blocking the event loop."""
         return await asyncio.to_thread(self.fetch_free_models)
 
     def get_fallback_chain(self, primary_model: str) -> List[str]:
-        """Build fallback chain based on configured provider and fallback models."""
         config = self._load_runtime_config()
-        fallback_models = config.get("fallback_models") or []
-
-        if isinstance(fallback_models, list) and fallback_models:
-            chain = [primary_model] + [model for model in fallback_models if model != primary_model]
-            return chain
-
-        if str(config.get("provider") or self.provider) == "openrouter":
-            free = self.fetch_free_models()
-            return [primary_model] + [m for m in free if m != primary_model]
-
-        return [primary_model]
-
-
-    async def call_ai_stream(self, prompt: str, history: List = [], system_prompt: str = "You are Nexus AI, a helpful personal assistant.", model: str = "openrouter/free", tools: Optional[List[Dict]] = None, tool_choice: Optional[str] = "auto", images: Optional[List[str]] = None):
-        runtime_config = self._load_runtime_config()
-        url, api_key, provider, headers = self._get_config(runtime_config)
-        
-        headers["Authorization"] = f"Bearer {api_key}"
-        
-        # Build messages
-        messages = []
-        
-        # System prompt handling
-        if provider == "duckai":
-            # DuckAI often dislikes 'system' role, so we merge it
-            if history:
-                for i, msg in enumerate(history):
-                    role = msg.role if hasattr(msg, 'role') else msg.get('role')
-                    content = msg.content if hasattr(msg, 'content') else msg.get('content')
-                    
-                    if i == 0 and role == "user":
-                        messages.append({"role": "user", "content": f"{system_prompt}\n\n{content}"})
-                    else:
-                        messages.append({"role": role, "content": content})
-                messages.append({"role": "user", "content": prompt})
-            else:
-                messages.append({"role": "user", "content": f"{system_prompt}\n\nUSER MESSAGE: {prompt}"})
+        primary = str(primary_model or config.get("model") or "openrouter/free")
+        if self.mock_mode:
+            return [primary]
+        configured = config.get("fallback_models") or []
+        if isinstance(configured, list) and configured:
+            configured_models = [str(item) for item in configured]
+            provider = str(config.get("provider") or self.provider).lower()
+            allow_paid = os.getenv("ALLOW_PAID_MODELS", "false").lower() in {
+                "1", "true", "yes"
+            }
+            if provider == "openrouter" and not allow_paid:
+                configured_models = [
+                    model
+                    for model in configured_models
+                    if model.endswith(":free") or model.startswith("openrouter/")
+                ]
+            candidates = [primary] + configured_models
+        elif str(config.get("provider") or self.provider).lower() == "openrouter":
+            candidates = [primary] + self.fetch_free_models()
         else:
-            # OpenRouter / Standard OpenAI-like
-            messages.append({"role": "system", "content": system_prompt})
-            for msg in history:
-                role = msg.role if hasattr(msg, 'role') else msg.get('role', 'user')
-                content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
-                item = {"role": role, "content": content}
-                
-                # Support tool calls in history
-                if hasattr(msg, 'tool_calls'):
-                    item["tool_calls"] = getattr(msg, 'tool_calls')
-                elif isinstance(msg, dict) and "tool_calls" in msg:
-                    item["tool_calls"] = msg["tool_calls"]
-                
-                # Support tool result (role: tool)
-                if role == "tool":
-                    if hasattr(msg, 'tool_call_id'):
-                        item["tool_call_id"] = getattr(msg, 'tool_call_id')
-                    elif isinstance(msg, dict) and "tool_call_id" in msg:
-                        item["tool_call_id"] = msg["tool_call_id"]
-                
-                # Support reasoning_details if present
-                if hasattr(msg, 'reasoning_details'):
-                    item["reasoning_details"] = getattr(msg, 'reasoning_details')
-                elif isinstance(msg, dict) and "reasoning_details" in msg:
-                    item["reasoning_details"] = msg["reasoning_details"]
-                    
-                messages.append(item)
-            
-            if images and len(images) > 0:
-                content_parts = [{"type": "text", "text": prompt}]
-                for img_url in images:
-                    content_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": img_url}
-                    })
+            candidates = [primary]
+        return list(dict.fromkeys(model for model in candidates if model))
+
+    @staticmethod
+    def _message_value(message: Any, key: str, default: Any = None) -> Any:
+        if hasattr(message, key):
+            return getattr(message, key)
+        if isinstance(message, dict):
+            return message.get(key, default)
+        return default
+
+    def _build_messages(
+        self,
+        prompt: str,
+        history: Optional[List[Any]],
+        system_prompt: str,
+        provider: str,
+        images: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
+        history = history or []
+        messages: List[Dict[str, Any]] = []
+
+        if provider == "duckai":
+            if history:
+                system_merged = False
+                for message in history:
+                    role = self._message_value(message, "role", "user")
+                    content = self._message_value(message, "content", "")
+                    item = {"role": role, "content": content}
+                    if role == "user" and not system_merged:
+                        item["content"] = f"{system_prompt}\n\n{content}"
+                        system_merged = True
+                    self._copy_tool_fields(message, item)
+                    messages.append(item)
+                if prompt:
+                    messages.append({"role": "user", "content": prompt})
+            elif prompt:
+                messages.append(
+                    {"role": "user", "content": f"{system_prompt}\n\nUSER MESSAGE: {prompt}"}
+                )
+            return messages
+
+        messages.append({"role": "system", "content": system_prompt})
+        for message in history:
+            role = self._message_value(message, "role", "user")
+            content = self._message_value(message, "content", "")
+            item: Dict[str, Any] = {"role": role, "content": content}
+            self._copy_tool_fields(message, item)
+            messages.append(item)
+
+        if prompt:
+            if images:
+                content_parts: List[Dict[str, Any]] = [
+                    {"type": "text", "text": prompt}
+                ]
+                for image_url in images[:4]:
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    )
                 messages.append({"role": "user", "content": content_parts})
             else:
                 messages.append({"role": "user", "content": prompt})
-        
-        # For OpenRouter, if model is simple like 'gpt-4o-mini', we might want to map it to full OpenRouter slug
-        # but the user might be passing the full slug already.
-        
-        payload = {
-            "model": model, 
+        return messages
+
+    def _copy_tool_fields(self, message: Any, item: Dict[str, Any]) -> None:
+        tool_calls = self._message_value(message, "tool_calls")
+        tool_call_id = self._message_value(message, "tool_call_id")
+        reasoning_details = self._message_value(message, "reasoning_details")
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+        if item.get("role") == "tool" and tool_call_id:
+            item["tool_call_id"] = tool_call_id
+        if reasoning_details:
+            item["reasoning_details"] = reasoning_details
+
+    async def _consume_sse(
+        self, response: httpx.Response
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Consume provider SSE and aggregate fragmented tool calls."""
+        tool_buffers: Dict[str, Dict[str, Any]] = {}
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            deltas = delta.get("tool_calls") or []
+            for fallback_index, call_delta in enumerate(deltas):
+                index = str(call_delta.get("index", fallback_index))
+                current = tool_buffers.setdefault(
+                    index,
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if call_delta.get("id"):
+                    current["id"] = call_delta["id"]
+                if call_delta.get("type"):
+                    current["type"] = call_delta["type"]
+                function_delta = call_delta.get("function") or {}
+                current["function"]["name"] += str(function_delta.get("name") or "")
+                current["function"]["arguments"] += str(
+                    function_delta.get("arguments") or ""
+                )
+            content = delta.get("content")
+            if content:
+                yield "text", content
+
+        if tool_buffers:
+            calls = [tool_buffers[key] for key in sorted(tool_buffers)]
+            for index, call in enumerate(calls):
+                if not call.get("id"):
+                    call["id"] = f"tool_call_{index}"
+            yield "tool_calls", calls
+
+    def _mock_response(self, prompt: str, system_prompt: str) -> str:
+        if "Nexus Cognitive Intent Analyzer" in system_prompt:
+            text = prompt.lower()
+            if any(term in text for term in ["microservice", "kubernetes", "observability dashboard"]):
+                domain, complexity, mode, model = (
+                    "architecture", 0.8, "systems_mode", "qwen/qwen3-coder:free"
+                )
+            elif any(term in text for term in ["lead", "closing", "funnel", "operasi"]):
+                domain, complexity, mode, model = (
+                    "operations", 0.65, "diagnosis_mode", "google/gemma-4-31b-it:free"
+                )
+            elif any(term in text for term in ["tacit knowledge", "governance", "ownership"]):
+                domain, complexity, mode, model = (
+                    "governance", 0.75, "strategic_mode", "google/gemma-4-31b-it:free"
+                )
+            elif any(term in text for term in ["seperti umur 5", "belajar", "jelaskan"]):
+                domain, complexity, mode, model = (
+                    "educational", 0.35, "educational_mode", "liquid/lfm-2.5-1.2b-instruct:free"
+                )
+            else:
+                domain, complexity, mode, model = (
+                    "factual", 0.3, "factual_mode", "liquid/lfm-2.5-1.2b-instruct:free"
+                )
+            return json.dumps(
+                {
+                    "domain": domain,
+                    "abstraction_level": 0.6 if domain in {"governance", "architecture"} else 0.3,
+                    "reasoning_complexity": complexity,
+                    "ambiguity_score": 0.15,
+                    "strategic_impact": 0.65 if domain in {"governance", "operations"} else 0.2,
+                    "operational_impact": 0.7 if domain in {"operations", "architecture"} else 0.2,
+                    "governance_relevance": 0.8 if domain == "governance" else 0.1,
+                    "suggested_mode": mode,
+                    "suggested_model": model,
+                    "requires_grill_me": False,
+                    "confidence": 0.95,
+                    "reasoning_rationale": "Deterministic development response.",
+                }
+            )
+        return f"[Mock Rohadi] Saya menerima pesan Anda: {prompt[:500]}"
+
+    async def call_ai_stream(
+        self,
+        prompt: str,
+        history: Optional[List[Any]] = None,
+        system_prompt: str = "You are Nexus AI, a helpful personal assistant.",
+        model: str = "openrouter/free",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = "auto",
+        images: Optional[List[str]] = None,
+    ) -> AsyncGenerator[str, None]:
+        if self.mock_mode:
+            yield self._mock_response(prompt, system_prompt)
+            return
+
+        runtime_config = self._load_runtime_config()
+        url, _, provider, headers = self._get_config(runtime_config)
+        messages = self._build_messages(
+            prompt, history, system_prompt, provider, images
+        )
+        payload: Dict[str, Any] = {
+            "model": model,
             "messages": messages,
             "temperature": 0.7,
-            "stream": True
+            "stream": True,
         }
-        
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
-            
+
         max_retries = 2
+        last_error = ""
         for attempt in range(max_retries):
             try:
-                print(f"[STREAM] {provider.upper()} Attempt {attempt + 1}/{max_retries} for model: {model}")
-                async with httpx.AsyncClient(timeout=180.0) as client:
-                    async with client.stream("POST", url, json=payload, headers=headers) as response:
-                        if response.status_code == 400 and tools:
-                            # If 400 error and we used tools, try again WITHOUT tools
-                            print(f"[STREAM ERROR] Model {model} returned 400. Retrying WITHOUT tools...")
-                            temp_payload = payload.copy()
-                            del temp_payload["tools"]
-                            if "tool_choice" in temp_payload:
-                                del temp_payload["tool_choice"]
-                            
-                            async with client.stream("POST", url, json=temp_payload, headers=headers) as retry_resp:
-                                if retry_resp.status_code == 200:
-                                    async for line in retry_resp.aiter_lines():
-                                        if line.startswith("data: "):
-                                            data_str = line[6:].strip()
-                                            if data_str == "[DONE]": return
-                                            try:
-                                                data = json.loads(data_str)
-                                                chunk = data["choices"][0].get("delta", {}).get("content", "")
-                                                if chunk: yield chunk
-                                            except: continue
+                print(
+                    f"[STREAM] {provider.upper()} attempt {attempt + 1}/{max_retries} model={model}"
+                )
+                timeout = httpx.Timeout(180.0, connect=15.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    async with client.stream(
+                        "POST", url, json=payload, headers=headers
+                    ) as response:
+                        response_to_consume = response
+                        status = response.status_code
+                        body = ""
+                        if status == 400 and tools:
+                            # Some free models reject function calling. Retry the
+                            # same request once without tools, but never expose a
+                            # half-formed tool call to the caller.
+                            fallback_payload = dict(payload)
+                            fallback_payload.pop("tools", None)
+                            fallback_payload.pop("tool_choice", None)
+                            async with client.stream(
+                                "POST", url, json=fallback_payload, headers=headers
+                            ) as fallback_response:
+                                if fallback_response.status_code == 200:
+                                    async for kind, value in self._consume_sse(
+                                        fallback_response
+                                    ):
+                                        if kind == "text":
+                                            yield value
                                     return
-                                else:
-                                    resp_text = await retry_resp.aread()
-                                    print(f"[STREAM ERROR] Retry without tools failed: {retry_resp.status_code} - {resp_text.decode()}")
+                                status = fallback_response.status_code
+                                body = (await fallback_response.aread())[:1_000].decode(
+                                    "utf-8", errors="replace"
+                                )
 
-                        if response.status_code != 200:
-                            resp_text = await response.aread()
-                            error_msg = f"Error: {response.status_code} - {resp_text.decode()}"
-                            print(f"[STREAM ERROR] {error_msg}")
-                            
-                            # For rate limit (429) and server errors (5xx), raise exception to trigger fallback
-                            if response.status_code in (429, 500, 502, 503, 504):
-                                raise Exception(f"Model {model} returned {response.status_code}: {error_msg}")
-                            
-                            # For other errors, yield error to frontend
-                            detailed_error = f"AI Provider ({provider}) returned {response.status_code}. Try again or switch model."
-                            yield f"data: {json.dumps({'type': 'error', 'message': detailed_error})}\n\n"
+                        if status != 200:
+                            if not body:
+                                body = (await response.aread())[:1_000].decode(
+                                    "utf-8", errors="replace"
+                                )
+                            last_error = f"AI provider returned {status}: {body}"
+                            if status in {408, 409, 425, 429, 500, 502, 503, 504}:
+                                raise RuntimeError(last_error)
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": f"AI provider returned HTTP {status}",
+                                        "retryable": False,
+                                    }
+                                )
+                                + "\n\n"
+                            )
                             return
-                        
-                        async for line in response.aiter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]":
-                                    return
-                                try:
-                                    data = json.loads(data_str)
-                                    if not data.get("choices"):
-                                        continue
-                                        
-                                    choice = data["choices"][0]
-                                    delta = choice.get("delta", {})
-                                    
-                                    if "tool_calls" in delta:
-                                        yield f"data: {json.dumps({'type': 'tool_call', 'tool_calls': delta['tool_calls']})}\n\n"
-                                        continue
-                                    
-                                    chunk = delta.get("content", "")
-                                    if chunk:
-                                        yield chunk
-                                except Exception as e:
-                                    continue
-                return
-                    
-            except Exception as e:
-                print(f"[STREAM ERROR] {str(e)}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                else:
-                    yield f"data: {json.dumps({'type': 'error', 'message': f'Connection error: {str(e)}'})}\n\n"
-                    return
 
-    def call_ai(self, prompt: str, history: List = [], system_prompt: str = "You are Nexus AI, a helpful personal assistant.", model: str = "google/gemma-3-27b-it:free", tools: Optional[List[Dict]] = None, tool_choice: Optional[str] = "auto", images: Optional[List[str]] = None) -> Optional[str]:
+                        async for kind, value in self._consume_sse(response_to_consume):
+                            if kind == "text":
+                                yield value
+                            else:
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        {
+                                            "type": "tool_calls",
+                                            "tool_calls": value,
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n\n"
+                                )
+                        return
+            except Exception as exc:
+                last_error = str(exc)
+                print(f"[STREAM ERROR] {last_error}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+
+        yield f"data: {json.dumps({'type': 'error', 'message': f'Connection error: {last_error}', 'retryable': True})}\n\n"
+
+    def call_ai(
+        self,
+        prompt: str,
+        history: Optional[List[Any]] = None,
+        system_prompt: str = "You are Nexus AI, a helpful personal assistant.",
+        model: str = "openrouter/free",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = "auto",
+        images: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        if self.mock_mode:
+            return self._mock_response(prompt, system_prompt)
+
         runtime_config = self._load_runtime_config()
-        url, api_key, provider, headers = self._get_config(runtime_config)
-        
-        headers["Authorization"] = f"Bearer {api_key}"
-            
-        messages = []
-        if provider == "duckai":
-            if history:
-                for i, msg in enumerate(history):
-                    role = msg.role if hasattr(msg, 'role') else msg.get('role')
-                    content = msg.content if hasattr(msg, 'content') else msg.get('content')
-                    if i == 0 and role == "user":
-                        messages.append({"role": "user", "content": f"{system_prompt}\n\n{content}"})
-                    else:
-                        messages.append({"role": role, "content": content})
-                messages.append({"role": "user", "content": prompt})
-            else:
-                messages.append({"role": "user", "content": f"{system_prompt}\n\nUSER MESSAGE: {prompt}"})
-        else:
-            messages.append({"role": "system", "content": system_prompt})
-            for msg in history:
-                role = msg.role if hasattr(msg, 'role') else msg.get('role', 'user')
-                content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
-                item = {"role": role, "content": content}
-                
-                # Support tool calls in history
-                if hasattr(msg, 'tool_calls'):
-                    item["tool_calls"] = getattr(msg, 'tool_calls')
-                elif isinstance(msg, dict) and "tool_calls" in msg:
-                    item["tool_calls"] = msg["tool_calls"]
-                
-                # Support tool result (role: tool)
-                if role == "tool":
-                    if hasattr(msg, 'tool_call_id'):
-                        item["tool_call_id"] = getattr(msg, 'tool_call_id')
-                    elif isinstance(msg, dict) and "tool_call_id" in msg:
-                        item["tool_call_id"] = msg["tool_call_id"]
-                
-                # Support reasoning_details if present
-                if hasattr(msg, 'reasoning_details'):
-                    item["reasoning_details"] = getattr(msg, 'reasoning_details')
-                elif isinstance(msg, dict) and "reasoning_details" in msg:
-                    item["reasoning_details"] = msg["reasoning_details"]
-                    
-                messages.append(item)
-            
-            if images and len(images) > 0:
-                content_parts = [{"type": "text", "text": prompt}]
-                for img_url in images:
-                    content_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": img_url}
-                    })
-                messages.append({"role": "user", "content": content_parts})
-            else:
-                messages.append({"role": "user", "content": prompt})
-        
-        payload = {
-            "model": model, 
-            "messages": messages,
-            "temperature": 0.7
+        url, _, provider, headers = self._get_config(runtime_config)
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": self._build_messages(
+                prompt, history, system_prompt, provider, images
+            ),
+            "temperature": 0.7,
         }
-        
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
-        
+
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=120)
-            if response.status_code == 200:
-                data = response.json()
-                message = data['choices'][0]['message']
-                if 'tool_calls' in message and message['tool_calls']:
-                    return json.dumps({'tool_calls': message['tool_calls']})
-                return message['content'].strip()
-            else:
-                print(f"{provider} Error: {response.status_code} - {response.text}")
-        except Exception as e:
-            print(f"{provider} Call Failed: {e}")
-        
-        return None
+            response.raise_for_status()
+            message = (response.json().get("choices") or [{}])[0].get("message") or {}
+            if message.get("tool_calls"):
+                return json.dumps({"tool_calls": message["tool_calls"]})
+            content = message.get("content")
+            return str(content).strip() if content is not None else ""
+        except Exception as exc:
+            print(f"[{provider}] call failed: {exc}")
+            return None
 
-    # Backward compatibility aliases
-    def call_duckai(self, *args, **kwargs):
-        return self.call_ai(*args, **kwargs)
-        
-    def call_duckai_stream(self, *args, **kwargs):
-        return self.call_ai_stream(*args, **kwargs)
+    call_duckai = call_ai
+    call_duckai_stream = call_ai_stream
 
-    async def execute_tool_call(self, tool_call: Dict) -> str:
-        """Execute a tool call with REAL web search"""
+    @staticmethod
+    def _safe_calculate(expression: str) -> float | int:
+        operators = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.Mod: operator.mod,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def evaluate(node: ast.AST) -> float | int:
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            if isinstance(node, ast.UnaryOp) and type(node.op) in operators:
+                return operators[type(node.op)](evaluate(node.operand))
+            if isinstance(node, ast.BinOp) and type(node.op) in operators:
+                left, right = evaluate(node.left), evaluate(node.right)
+                if isinstance(node.op, ast.Pow) and abs(right) > 20:
+                    raise ValueError("Exponent is too large")
+                return operators[type(node.op)](left, right)
+            raise ValueError("Only basic arithmetic is allowed")
+
+        tree = ast.parse((expression or "")[:200], mode="eval")
+        result = evaluate(tree)
+        if abs(float(result)) > 1e100:
+            raise ValueError("Result is too large")
+        return result
+
+    async def execute_tool_call(self, tool_call: Dict[str, Any]) -> str:
         from tools.web_search_tool import web_search_tool
-        
-        tool_name = tool_call.get('function', {}).get('name', '')
-        arguments = tool_call.get('function', {}).get('arguments', '{}')
-        
+
+        function = tool_call.get("function") or {}
+        tool_name = str(function.get("name") or "")
+        arguments = function.get("arguments") or {}
         try:
-            args = json.loads(arguments)
-            if tool_name == 'web_search':
-                query = args.get('query', '')
-                num_results = args.get('num_results', 5)
-                print(f"[TOOL] Executing real web search: {query}")
-                result = await web_search_tool.search(query, num_results)
-                if 'error' in result:
-                    return json.dumps({"error": result['error']})
-                formatted_results = []
-                for i, res in enumerate(result.get('results', []), 1):
-                    formatted_results.append(
-                        f"{i}. {res.get('title', 'No title')}\n"
-                        f"   URL: {res.get('url', 'N/A')}\n"
-                        f"   Snippet: {res.get('snippet', 'N/A')}"
-                    )
-                return json.dumps({
-                    "query": query,
-                    "results": '\n\n'.join(formatted_results),
-                    "total_results": result.get('results_count', 0),
-                    "source": "DuckDuckGo (real-time)",
-                    "timestamp": "live"
-                })
-            elif tool_name == 'research_topic':
-                topic = args.get('topic', '')
-                depth = args.get('depth', 'shallow')
-                print(f"[TOOL] Conducting deep research: {topic}")
-                search_result = await web_search_tool.search(topic, num_results=10 if depth == 'deep' else 5)
-                if 'error' in search_result:
-                    return json.dumps({"error": search_result['error']})
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+            if not isinstance(args, dict):
+                raise ValueError("Tool arguments must be an object")
+
+            if tool_name == "web_search":
+                result = await web_search_tool.search(
+                    str(args.get("query") or ""),
+                    max(1, min(int(args.get("num_results", 5)), 10)),
+                )
+                return json.dumps(result, ensure_ascii=False)
+
+            if tool_name == "research_topic":
+                topic = str(args.get("topic") or "")[:500]
+                depth = str(args.get("depth") or "shallow")
+                search_result = await web_search_tool.search(
+                    topic, num_results=10 if depth == "deep" else 5
+                )
+                if "error" in search_result:
+                    return json.dumps(search_result)
                 detailed_content = []
-                urls_to_fetch = search_result.get('results', [])[:3]
-                for url_data in urls_to_fetch:
-                    url = url_data.get('url', '')
-                    if url:
-                        content = await web_search_tool.fetch_url_content(url)
-                        if 'error' not in content:
-                            detailed_content.append({
+                for url_data in search_result.get("results", [])[:3]:
+                    url = url_data.get("url", "")
+                    if not url:
+                        continue
+                    content = await web_search_tool.fetch_url_content(url)
+                    if "error" not in content:
+                        detailed_content.append(
+                            {
                                 "url": url,
-                                "title": content.get('title', ''),
-                                "content": content.get('content', '')[:500]
-                            })
+                                "title": content.get("title", ""),
+                                "content": content.get("content", "")[:500],
+                            }
+                        )
                 paa = await web_search_tool.get_people_also_ask(topic)
                 related = await web_search_tool.get_related_searches(topic)
-                return json.dumps({
-                    "topic": topic,
-                    "search_results": search_result.get('results', [])[:5],
-                    "detailed_content": detailed_content,
-                    "people_also_ask": paa.get('questions', []),
-                    "related_searches": related.get('related_searches', []),
-                    "depth": depth,
-                    "source": "Multiple real-time sources"
-                })
-            elif tool_name == 'fetch_url':
-                url = args.get('url', '')
-                print(f"[TOOL] Fetching URL content: {url}")
-                result = await web_search_tool.fetch_url_content(url)
-                return json.dumps(result)
-            elif tool_name == 'get_people_also_ask':
-                query = args.get('query', '')
-                print(f"[TOOL] Getting PAA for: {query}")
-                result = await web_search_tool.get_people_also_ask(query)
-                return json.dumps(result)
-            elif tool_name == 'get_related_searches':
-                query = args.get('query', '')
-                print(f"[TOOL] Getting related searches for: {query}")
-                result = await web_search_tool.get_related_searches(query)
-                return json.dumps(result)
-            elif tool_name == 'calculate':
-                expression = args.get('expression', '')
+                return json.dumps(
+                    {
+                        "topic": topic,
+                        "search_results": search_result.get("results", [])[:5],
+                        "detailed_content": detailed_content,
+                        "people_also_ask": paa.get("questions", []),
+                        "related_searches": related.get("related_searches", []),
+                        "depth": depth,
+                    },
+                    ensure_ascii=False,
+                )
+
+            if tool_name == "fetch_url":
+                return json.dumps(
+                    await web_search_tool.fetch_url_content(str(args.get("url") or "")),
+                    ensure_ascii=False,
+                )
+
+            if tool_name == "get_people_also_ask":
+                return json.dumps(
+                    await web_search_tool.get_people_also_ask(
+                        str(args.get("query") or "")
+                    ),
+                    ensure_ascii=False,
+                )
+
+            if tool_name == "get_related_searches":
+                return json.dumps(
+                    await web_search_tool.get_related_searches(
+                        str(args.get("query") or "")
+                    ),
+                    ensure_ascii=False,
+                )
+
+            if tool_name == "get_current_time":
+                timezone_name = str(args.get("timezone") or "UTC")
                 try:
-                    result = eval(expression, {"__builtins__": {}}, {})
-                    return json.dumps({"result": result})
-                except:
-                    return json.dumps({"error": "Invalid expression"})
-            elif tool_name == 'get_current_time':
-                from datetime import datetime
-                return json.dumps({"current_time": datetime.now().isoformat()})
-            else:
-                return json.dumps({"error": f"Unknown tool: {tool_name}"})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+                    current = datetime.now(ZoneInfo(timezone_name))
+                except Exception:
+                    current = datetime.now(timezone.utc)
+                return json.dumps(
+                    {"current_time": current.isoformat(), "timezone": timezone_name}
+                )
+
+            if tool_name == "calculate":
+                return json.dumps(
+                    {"result": self._safe_calculate(str(args.get("expression") or ""))}
+                )
+
+            if tool_name == "grill_me":
+                from tools.grill_me_skill_v2 import grill_me_skill
+
+                question = await asyncio.to_thread(
+                    grill_me_skill.generate_grill_question,
+                    str(args.get("user_idea") or ""),
+                    [],
+                    "tool-grill",
+                )
+                return json.dumps(
+                    {"response": grill_me_skill.format_response(question)},
+                    ensure_ascii=False,
+                )
+
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        except Exception as exc:
+            return json.dumps({"error": str(exc)})
+
 
 ai_service = AIService()

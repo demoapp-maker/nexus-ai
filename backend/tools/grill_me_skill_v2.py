@@ -18,17 +18,13 @@ Core Changes:
 This is NOT a template system. This is a diagnostic reasoning engine.
 """
 
-from typing import Dict, List, Optional, Tuple, Set
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-import re
+from typing import Dict, List, Optional
 
 # Import Solution Restraint System
-from tools.solution_restraint_system import (
-    solution_restraint_system,
-    SolutionType,
-    RestraintDecision
-)
+from tools.solution_restraint_system import RestraintDecision, solution_restraint_system
 
 
 class TGM_Layer(Enum):
@@ -866,62 +862,67 @@ class GrillMeSkillV2:
             state.session_complete = True
             return self._generate_wrap_up_message(state)
         
-        # === SOLUTION RESTRAINT CHECK ===
-        # Evaluate whether we should restrain from providing solutions
-        restraint_decision = solution_restraint_system.evaluate_diagnosis_sufficiency(
-            conversation_state=state,
-            user_input=user_input,
-            requested_solution_type=None  # Auto-detect from input
-        )
-        
-        # If restraint is needed, generate diagnostic question instead of solution
-        if restraint_decision.should_restrain:
-            print(f"[SOLUTION RESTRAINT] Activated - Confidence: {restraint_decision.confidence_score:.2f}")
-            print(f"[SOLUTION RESTRAINT] Reason: {restraint_decision.restraint_reasoning[:100]}...")
-            
-            # Generate restraint-aware question
-            return self._generate_restraint_question(restraint_decision, state, user_input)
-        
-        # === NORMAL DIAGNOSTIC FLOW ===
-        # Analyze user input for strategic signals
+        # Analyze the current input before evaluating restraint. The previous
+        # ordering evaluated a brand-new zeroed state and returned without ever
+        # updating it, so every turn could repeat the same question forever.
         analysis = self.context_analyzer.analyze_input(user_input, state)
-        
-        # Record signals in state
+
         for signal in analysis.detected_signals:
             state.add_signal(
                 DiagnosticSignal(signal["type"]),
                 signal.get("text_snippet", signal.get("matched_pattern", "")),
-                state.current_focus_layer
+                state.current_focus_layer,
             )
-        
-        # Update TGM layer clarity based on response quality
+
         if state.current_focus_layer:
-            clarity_score = 1.0 - analysis.ambiguity_score
-            state.update_layer_clarity(state.current_focus_layer, clarity_score)
-        
-        # Generate contextual question
-        question_data = self.question_generator.generate_question(analysis, state)
-        
-        # Update state
-        state.question_history.append({
-            "question": question_data["question"],
-            "user_response": user_input,
-            "focus_layer": question_data.get("focus_layer"),
-            "analysis": {
-                "ambiguity": analysis.ambiguity_score,
-                "signals": len(analysis.detected_signals),
-                "confidence": analysis.confidence
-            }
-        })
-        state.total_questions_asked += 1
-        state.current_focus_layer = TGM_Layer(question_data.get("focus_layer")) \
-            if question_data.get("focus_layer") in [l.value for l in TGM_Layer] \
-            else None
-        state.response_depth_scores.append(1.0 - analysis.ambiguity_score)
-        
-        # Extract business context from user input
+            state.update_layer_clarity(
+                state.current_focus_layer, 1.0 - analysis.ambiguity_score
+            )
         self._extract_business_context(user_input, state)
-        
+
+        restraint_decision = solution_restraint_system.evaluate_diagnosis_sufficiency(
+            conversation_state=state,
+            user_input=user_input,
+            requested_solution_type=None,
+        )
+
+        if restraint_decision.should_restrain:
+            print(
+                f"[SOLUTION RESTRAINT] Activated - Confidence: "
+                f"{restraint_decision.confidence_score:.2f}"
+            )
+            print(
+                f"[SOLUTION RESTRAINT] Reason: "
+                f"{restraint_decision.restraint_reasoning[:100]}..."
+            )
+            question_data = self._generate_restraint_question(
+                restraint_decision, state, user_input
+            )
+        else:
+            question_data = self.question_generator.generate_question(analysis, state)
+
+        # Every turn, including restraint turns, advances the session state.
+        state.question_history.append(
+            {
+                "question": question_data["question"],
+                "user_response": user_input,
+                "focus_layer": question_data.get("focus_layer"),
+                "analysis": {
+                    "ambiguity": analysis.ambiguity_score,
+                    "signals": len(analysis.detected_signals),
+                    "confidence": analysis.confidence,
+                    "restraint": restraint_decision.should_restrain,
+                },
+            }
+        )
+        state.total_questions_asked += 1
+        focus_layer = question_data.get("focus_layer")
+        state.current_focus_layer = (
+            TGM_Layer(focus_layer)
+            if focus_layer in [layer.value for layer in TGM_Layer]
+            else None
+        )
+        state.response_depth_scores.append(1.0 - analysis.ambiguity_score)
         return question_data
     
     def _generate_restraint_question(
@@ -995,9 +996,7 @@ class GrillMeSkillV2:
         # Generate contextual recommendation
         recommendation = (
             f"**Mengapa saya menahan diri:**\n"
-            f"{restraint_decision.restraint_reasoning}\n\n"
-            f"Saya lebih memilih untuk memastikan diagnosis cukup solid dulu, "
-            f"baru kemudian menyusun rekomendasi yang benar-benar aligned dengan kondisi Anda."
+            f"{restraint_decision.restraint_reasoning}"
         )
         
         return {
@@ -1043,7 +1042,7 @@ class GrillMeSkillV2:
         unclear_layers = state.get_unclear_layers(threshold=0.7)
         
         if unclear_layers:
-            summary = f"\n\n**Areas yang masih perlu clarification:**\n"
+            summary = "\n\n**Areas yang masih perlu clarification:**\n"
             for layer in unclear_layers[:3]:
                 clarity = state.tgm_layer_clarity[layer]
                 summary += f"- {layer.value.replace('_', ' ').title()} (clarity: {clarity:.0%})\n"

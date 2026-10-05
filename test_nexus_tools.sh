@@ -1,68 +1,32 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=========================================="
-echo "Testing Nexus-AI Tool Integration"
-echo "=========================================="
-echo ""
+BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 
-# Test 1: Health check
-echo "🏥 Test 1: Health check..."
-curl -s http://localhost:8000/health | python3 -m json.tool
-echo ""
-echo "---"
-echo ""
+printf 'Checking Nexus AI at %s\n' "$BASE_URL"
+curl --fail --silent --show-error "$BASE_URL/health" | python3 -m json.tool
 
-# Test 2: Regular chat (no tools)
-echo "💬 Test 2: Regular chat..."
-curl -s -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Hello, how are you?",
-    "session_id": "test-1"
-  }' | python3 -m json.tool
-echo ""
-echo "---"
-echo ""
+regular_response=$(curl --fail --silent --show-error -X POST "$BASE_URL/chat" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Hello, how are you?","session_id":"smoke-direct"}')
+python3 -c 'import json,sys; data=json.loads(sys.stdin.read()); assert data["response"]' <<<"$regular_response"
+printf 'Regular chat: OK\n'
 
-# Test 3: Chat with tools (streaming)
-echo "🔧 Test 3: Chat with tools (streaming endpoint)..."
-echo "Note: This will stream responses with potential tool calls"
-curl -s -X POST http://localhost:8000/chat/tools \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "What is the latest news about AI?",
-    "session_id": "test-tools-1",
-    "model": "gpt-4o-mini"
-  }'
-echo ""
-echo "---"
-echo ""
+stream_response=$(curl --fail --silent --show-error -N -X POST "$BASE_URL/chat/tools" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"What is the latest news about AI?","session_id":"smoke-tools","model":"openrouter/free"}')
+grep -q 'data: \[DONE\]' <<<"$stream_response"
+grep -q '"type": "info"' <<<"$stream_response"
+printf 'Streaming chat: OK\n'
 
-# Test 4: Autonomous research
-echo "🔍 Test 4: Autonomous research..."
-echo "This may take a minute as it performs multiple searches..."
-curl -s -X POST http://localhost:8000/research/autonomous \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Research the benefits of renewable energy",
-    "session_id": "research-test-1"
-  }' | python3 -m json.tool
-echo ""
-echo "---"
-echo ""
+research_response=$(curl --fail --silent --show-error -X POST "$BASE_URL/research/autonomous" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Research the benefits of renewable energy","session_id":"smoke-research"}')
+python3 -c 'import json,sys; data=json.loads(sys.stdin.read()); assert data["query"]; assert "final_report" in data' <<<"$research_response"
+printf 'Autonomous research: OK\n'
 
-# Test 5: Task planning
-echo "📋 Test 5: Task planning..."
-curl -s -X POST http://localhost:8000/planning/task \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Create a plan to build a web scraping application",
-    "session_id": "planning-test-1"
-  }' | python3 -m json.tool
-echo ""
-echo "---"
-echo ""
-
-echo "✅ All Nexus-AI tests completed!"
-echo ""
-echo "Check the server logs for detailed execution information."
+planning_response=$(curl --fail --silent --show-error -X POST "$BASE_URL/planning/task" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Create a plan to build a web scraping application","session_id":"smoke-planning"}')
+python3 -c 'import json,sys; data=json.loads(sys.stdin.read()); assert isinstance(data,dict)' <<<"$planning_response"
+printf 'Task planning: OK\n'

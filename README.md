@@ -1,96 +1,146 @@
-# 🚀 Nexus AI: Rohadi Edition
-### Asisten AI Strategis dengan Framework TGM & Memori Terpusat
+# Nexus AI — Rohadi Edition
 
-Nexus AI adalah platform orkestrasi AI tingkat lanjut yang ditenagai oleh **Rohadi**, asisten AI pribadi yang dirancang untuk membantu dalam strategi bisnis, coding, dan riset mendalam. Proyek ini menggabungkan backend FastAPI dengan frontend Next.js modern, dilengkapi dengan **Total Growth Marketing (TGM)** framework dan memori episodik terpusat.
+Nexus AI adalah asisten AI strategis berbasis FastAPI + Next.js. Backend memakai cognitive routing, policy-driven response modes, tool calling, web research, Grill-Me/TGM, dan memory per session.
 
-![Nexus AI](https://img.shields.io/badge/Identity-Rohadi-orange)
-![Framework](https://img.shields.io/badge/Strategy-TGM-blue)
-![Memory](https://img.shields.io/badge/Memory-Mira%20Central-purple)
-![Provider](https://img.shields.io/badge/Provider-OpenRouter-black)
+> Status: development/production-ready baseline. Provider AI tetap membutuhkan API key yang valid, kecuali menggunakan `NEXUS_MOCK_AI=true` untuk smoke test lokal.
 
----
+## Arsitektur singkat
 
-## Untuk AI Agent Coder
-Sebelum mengubah kode, baca panduan wajib di AGENT.md.
+```text
+Browser
+  │ same-origin Next.js proxy
+  ▼
+frontend (Next.js 16) ──► backend (FastAPI/SSE)
+                              ├─ CognitiveRouter + PolicyEngine
+                              ├─ AIService (OpenRouter/Alibaba/DuckAI)
+                              ├─ WebSearchTool (bounded public fetch)
+                              ├─ Grill-Me v2
+                              └─ SQLite memory per session
+```
 
-## ✨ Fitur Unggulan
+Endpoint utama:
 
-- **🔥 Grill-Me (TGM Edition)**: Mode "Arsitek" di mana Rohadi menginterview Anda menggunakan framework **Total Growth Marketing (TGM)**. Mematangkan rencana bisnis atau arsitektur coding sebelum eksekusi.
-- **🧠 Centralized Global Brain**: Seluruh pengetahuan dan interaksi dari semua pengguna disentralisasi ke dalam satu "otak besar" di **Mira Context** (`nexus_central`). Rohadi belajar secara kolektif dari setiap sesi.
-- **🤖 Identitas Rohadi**: Asisten yang konsisten, ramah, dan profesional. Dirancang untuk tidak membocorkan model dasarnya dan fokus memberikan solusi strategis.
-- **🔄 Auto-Routing & Fallback**: Menggunakan **OpenRouter** sebagai provider utama dengan sistem fallback otomatis ke model-model free jika terjadi kegagalan sistem.
-- **🔍 Research & Tooling**: Akses real-time ke pencarian web, analisis kompetitor, dan riset topik mendalam yang terintegrasi langsung ke dalam percakapan.
-- **💬 Streaming UI Modern**: Antarmuka responsif dengan dukungan gambar, file upload, dan visualisasi eksekusi tool secara real-time.
+- `GET /health` — liveness.
+- `GET /ready` — database readiness.
+- `POST /chat/tools` — canonical cognitive-routing SSE chat.
+- `POST /chat/stream` — compatibility alias ke `/chat/tools`.
+- `POST /chat` — non-streaming chat.
+- `POST /chat/grill` — explicit Grill-Me mode.
+- `POST /research/autonomous` — bounded research workflow.
+- `POST /planning/task` — task planning.
+- `/admin/*` — wajib menggunakan `X-Admin-Token`.
 
----
+## Menjalankan secara lokal
 
-## 🛠️ Stack Teknologi
+### 1. Backend
 
-### Backend
-- **Framework**: FastAPI (Python 3.10+)
-- **Identity Engine**: Rohadi Custom System Prompt
-- **Memory Manager**: Mira (Centralized Episodic Memory)
-- **AI Provider**: OpenRouter (Primary), DuckAI (Secondary)
-- **Orchestration**: PM2
+```bash
+cd backend
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Isi OPENROUTER_API_KEY dan ADMIN_PANEL_TOKEN bila diperlukan
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
-### Frontend
-- **Framework**: Next.js 16 (App Router / Turbopack)
-- **Styling**: Tailwind CSS & Framer Motion
-- **Persistence**: Browser LocalStorage (UI Sessions) & Mira (Global Knowledge)
+Jika `DATABASE_URL` kosong, backend otomatis memakai SQLite lokal di `backend/data/nexus_config.db`. Memory percakapan disimpan di `backend/data/nexus_memory.db`.
 
----
+Untuk smoke test tanpa provider eksternal:
 
-## 🏗️ Framework Strategis: TGM
+```bash
+NEXUS_MOCK_AI=true ADMIN_PANEL_TOKEN=local-admin \
+  python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
-Rohadi menggunakan 7 pilar **Total Growth Marketing** dalam setiap sesi Grill-Me:
-1. **Strategic**: Understanding Market, Value Creation, Brand Blueprint.
-2. **Tactical**: Awareness, Acquisition, Activation, CRM.
-3. **Engine**: Data & Insight untuk Continuous Learning & Optimization.
+### 2. Frontend
 
----
+```bash
+cd frontend
+npm ci
+npm run dev -- --hostname 0.0.0.0 --port 5008
+```
 
-## 🚀 Memulai Cepat
+Frontend hanya memanggil route relatif `/api/...`. Proxy Next.js meneruskan request ke `BACKEND_URL`, sehingga browser tidak perlu mengakses `localhost` secara langsung.
 
-### Akses Publik
-Kunjungi: [https://chat.mrohadiz.my.id/](https://chat.mrohadiz.my.id/)
+Untuk production:
 
-### Instalasi Lokal
-1. **Klon & Setup**:
-   ```bash
-   git clone https://github.com/mrohadiz/nexus-ai.git
-   cd nexus-ai
-   ```
+```bash
+npm run build
+BACKEND_URL=http://127.0.0.1:8000 npm run start -- --hostname 0.0.0.0 --port 5008
+```
 
-2. **Backend**:
-   ```bash
-   cd backend && pip install -r requirements.txt
-   cp .env.example .env # Isi OPENROUTER_API_KEY
-   ```
+### 3. PM2
 
-3. **Frontend**:
-   ```bash
-   cd frontend && npm install
-   ```
+```bash
+./nexus.sh build
+./nexus.sh start
+./nexus.sh status
+./nexus.sh logs
+```
 
-4. **Jalankan via PM2**:
-   ```bash
-   ./nexus.sh start
-   ```
+Path PM2 dihitung relatif terhadap lokasi repo; tidak ada asumsi `/root/nexus-ai`.
 
----
+## Konfigurasi penting
 
-## 📂 Struktur Proyek
-- `/backend/logic/ai_service.py`: Jantung orkestrasi model & auto-routing.
-- `/backend/logic/memory_manager.py`: Pengelola memori terpusat Mira.
-- `/frontend/src/components/ChatInterface.tsx`: UI Utama dengan mode Grill-Me.
+Lihat `backend/.env.example`. Variable terpenting:
 
----
+- `DATABASE_URL` — kosong untuk SQLite lokal, PostgreSQL untuk production.
+- `NEXUS_MEMORY_DB` — path memory; path relatif dihitung dari folder `backend`.
+- `CORS_ORIGINS` — daftar origin frontend dipisahkan koma.
+- `ADMIN_PANEL_TOKEN` — wajib untuk mengaktifkan endpoint admin.
+- `NEXUS_CONFIG_ENCRYPTION_KEY` — Fernet key wajib jika API key disimpan melalui `/admin/config`.
+- `RATE_LIMIT_PER_MINUTE` dan `MAX_REQUEST_BODY_BYTES` — abuse protection.
+- `ENABLE_GLOBAL_MEMORY=false` — default untuk mencegah kebocoran lintas session.
+- `NEXUS_MOCK_AI=false` — hanya untuk development/smoke test.
 
-## 🛡️ Keamanan & Privasi
-- **No Login Required**: Tidak ada database pengguna di backend.
-- **Client-Side Persistence**: Riwayat chat hanya ada di browser Anda.
-- **Global Intelligence**: Pengetahuan yang dipelajari Rohadi bersifat anonim dan terpusat di Mira.
+API key tidak dikembalikan oleh endpoint admin; hanya status `api_key_set` yang ditampilkan.
 
----
+## Pengujian dan quality gate
 
-**Dikembangkan oleh Tim Nexus AI untuk Pertumbuhan Bisnis yang Scalable.** 🚀
+```bash
+# Backend unit/security tests
+pytest -q
+
+# Static checks
+ruff check backend
+
+# Frontend
+cd frontend
+npm run lint
+npm run typecheck
+npm run build
+
+# Saat backend test server aktif
+cd ..
+./test_nexus_tools.sh
+python3 test_cognitive_routing_matrix.py
+python3 test_nexus_routing.py
+```
+
+Untuk menjalankan smoke test end-to-end tanpa biaya provider:
+
+```bash
+NEXUS_MOCK_AI=true ADMIN_PANEL_TOKEN=test-admin \
+  PYTHONPATH=backend python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+## Security notes
+
+- Jangan mengaktifkan global memory pada deployment multi-tenant tanpa anonymization dan consent.
+- `fetch_url` hanya menerima HTTP(S) ke host publik, membatasi redirect dan ukuran response.
+- Tool calculation tidak memakai `eval`.
+- Admin endpoint fail-closed jika token belum dikonfigurasi.
+- Gunakan reverse proxy/WAF rate limiter bersama limiter process-local untuk production berskala banyak worker.
+
+## Struktur repository
+
+- `backend/main.py` — FastAPI app dan canonical SSE pipeline.
+- `backend/logic/ai_service.py` — provider abstraction, streaming, tool aggregation, fallback.
+- `backend/logic/cognitive_router.py` — intent profile dan deterministic fallback.
+- `backend/logic/routing_policy.py` — policy selection.
+- `backend/logic/memory_manager.py` — scoped memory queue.
+- `backend/tools/web_search_tool.py` — search dan bounded public fetch.
+- `backend/tools/grill_me_skill_v2.py` — stateful diagnostic Grill-Me.
+- `frontend/src/components/ChatInterface.tsx` — UI chat utama.
+- `frontend/src/app/api/chat/*` — same-origin backend proxy.

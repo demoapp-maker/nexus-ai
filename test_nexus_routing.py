@@ -1,8 +1,10 @@
-import requests
 import json
+import os
 import time
 
-BASE_URL = "http://localhost:8000"
+import requests
+
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
 def test_query(message, description):
     print(f"\n--- TEST: {description} ---")
@@ -12,7 +14,7 @@ def test_query(message, description):
         "message": message,
         "history": [],
         "session_id": "test_session",
-        "model": "google/gemini-2.0-flash-001"
+        "model": "openrouter/free"
     }
     
     try:
