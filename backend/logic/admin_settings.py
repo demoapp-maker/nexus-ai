@@ -10,14 +10,29 @@ from logic.routing_metrics import routing_metrics
 from logic.secrets import SecretConfigError, decrypt_secret, encrypt_secret
 from sqlalchemy import text
 
+_PROVIDER_ALIASES = {
+    "omni-route": "omniroute",
+    "omni_route": "omniroute",
+    "openai-compatible": "omniroute",
+    "openai_compatible": "omniroute",
+}
+
+
+def normalize_provider(value: str) -> str:
+    provider = (value or "").strip().lower()
+    return _PROVIDER_ALIASES.get(provider, provider)
+
 
 def _normalize_base_url(provider: str, base_url: str) -> str:
+    provider = normalize_provider(provider)
     value = (base_url or "").strip().rstrip("/")
     if not value:
         if provider == "alibaba":
             value = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
         elif provider == "openrouter":
             value = "https://openrouter.ai/api/v1"
+        elif provider == "omniroute":
+            value = os.getenv("OMNIROUTE_URL", "http://127.0.0.1:20128/v1")
         else:
             value = "https://api.openai.com/v1"
 
@@ -28,8 +43,14 @@ def _normalize_base_url(provider: str, base_url: str) -> str:
 
 
 def _default_runtime_config() -> Dict[str, Any]:
-    provider = os.getenv("DEFAULT_AI_PROVIDER", "openrouter")
-    if provider == "alibaba":
+    provider = normalize_provider(os.getenv("DEFAULT_AI_PROVIDER", "omniroute"))
+    if provider == "omniroute":
+        base_url = os.getenv("OMNIROUTE_URL", "http://127.0.0.1:20128/v1")
+        api_key = os.getenv("OMNIROUTE_API_KEY", "")
+        model = os.getenv("OMNIROUTE_MODEL", "auto")
+        referer = os.getenv("OMNIROUTE_REFERER", "")
+        title = os.getenv("OMNIROUTE_TITLE", "Nexus AI")
+    elif provider == "alibaba":
         base_url = os.getenv("ALIBABA_AI_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
         api_key = os.getenv("ALIBABA_AI_KEY", os.getenv("ALIBABA_API_KEY", ""))
         model = os.getenv("ALIBABA_AI_MODEL", "qwen-plus")
@@ -41,12 +62,18 @@ def _default_runtime_config() -> Dict[str, Any]:
         model = os.getenv("DUCKAI_MODEL", "gpt-4o-mini")
         referer = os.getenv("DUCKAI_REFERER", "")
         title = os.getenv("DUCKAI_TITLE", "Nexus AI")
-    else:
+    elif provider == "openrouter":
         base_url = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1")
         api_key = os.getenv("OPENROUTER_API_KEY", "")
         model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
         referer = os.getenv("OPENROUTER_REFERER", "https://nexus-ai.local")
         title = os.getenv("OPENROUTER_TITLE", "Nexus AI")
+    else:
+        base_url = os.getenv("OPENAI_COMPATIBLE_URL", "http://127.0.0.1:20128/v1")
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+        model = os.getenv("OPENAI_COMPATIBLE_MODEL", "auto")
+        referer = os.getenv("OPENAI_COMPATIBLE_REFERER", "")
+        title = os.getenv("OPENAI_COMPATIBLE_TITLE", "Nexus AI")
 
     return {
         "provider": provider,
@@ -59,6 +86,32 @@ def _default_runtime_config() -> Dict[str, Any]:
         "extra_headers": {},
         "source": "environment",
     }
+
+
+def _environment_api_key(provider: str) -> str:
+    provider = normalize_provider(provider)
+    if provider == "omniroute":
+        return os.getenv("OMNIROUTE_API_KEY", "")
+    if provider == "openrouter":
+        return os.getenv("OPENROUTER_API_KEY", "")
+    if provider == "alibaba":
+        return os.getenv("ALIBABA_AI_KEY", os.getenv("ALIBABA_API_KEY", ""))
+    if provider == "duckai":
+        return os.getenv("DUCKAI_API_KEY", "")
+    return os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+
+
+def _environment_model(provider: str) -> str:
+    provider = normalize_provider(provider)
+    if provider == "omniroute":
+        return os.getenv("OMNIROUTE_MODEL", "auto")
+    if provider == "openrouter":
+        return os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    if provider == "alibaba":
+        return os.getenv("ALIBABA_AI_MODEL", "qwen-plus")
+    if provider == "duckai":
+        return os.getenv("DUCKAI_MODEL", "gpt-4o-mini")
+    return os.getenv("OPENAI_COMPATIBLE_MODEL", "auto")
 
 
 def _row_to_config(row: AIProviderConfig) -> Dict[str, Any]:
@@ -76,11 +129,12 @@ def _row_to_config(row: AIProviderConfig) -> Dict[str, Any]:
         # Keep health/config endpoints usable while making the provider appear
         # unconfigured until the encryption key is supplied.
         stored_api_key = ""
-    env_api_key = str(_default_runtime_config().get("api_key") or "")
+    provider = normalize_provider(row.provider)
+    env_api_key = _environment_api_key(provider)
 
     return {
-        "provider": row.provider,
-        "base_url": _normalize_base_url(row.provider, row.base_url),
+        "provider": provider,
+        "base_url": _normalize_base_url(provider, row.base_url),
         "api_key": stored_api_key or env_api_key,
         "model": row.model,
         "fallback_models": fallback_models,
@@ -92,11 +146,41 @@ def _row_to_config(row: AIProviderConfig) -> Dict[str, Any]:
     }
 
 
+def _is_legacy_openrouter_default(row: AIProviderConfig) -> bool:
+    """Identify the old auto-created default without touching explicit configs."""
+    base_url = str(row.base_url or "").rstrip("/")
+    return (
+        normalize_provider(str(row.provider or "")) == "openrouter"
+        and not row.api_key
+        and str(row.model or "") in {"", "openrouter/free"}
+        and base_url
+        in {
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/chat/completions",
+        }
+        and not (row.fallback_models or [])
+    )
+
+
 def ensure_default_ai_config() -> Dict[str, Any]:
     session = SessionLocal()
     try:
         row = session.query(AIProviderConfig).filter(AIProviderConfig.is_active.is_(True)).order_by(AIProviderConfig.updated_at.desc()).first()
+        defaults = _default_runtime_config()
         if row:
+            if (
+                defaults["provider"] == "omniroute"
+                and _is_legacy_openrouter_default(row)
+            ):
+                row.provider = defaults["provider"]
+                row.base_url = defaults["base_url"]
+                row.model = defaults["model"]
+                row.fallback_models = defaults["fallback_models"]
+                row.referer = defaults["referer"]
+                row.title = defaults["title"]
+                row.extra_headers = defaults["extra_headers"]
+                session.commit()
+                session.refresh(row)
             return _row_to_config(row)
 
         defaults = _default_runtime_config()
@@ -140,7 +224,7 @@ def update_ai_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             row = AIProviderConfig(is_active=True)
             session.add(row)
 
-        provider = str(payload.get("provider") or "openrouter").strip().lower()
+        provider = normalize_provider(str(payload.get("provider") or "omniroute"))
         base_url = _normalize_base_url(provider, str(payload.get("base_url") or ""))
         fallback_models = payload.get("fallback_models") or []
         if isinstance(fallback_models, str):
@@ -157,7 +241,7 @@ def update_ai_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         elif previous_provider and previous_provider != provider:
             # Never accidentally send a key for provider A to provider B.
             row.api_key = ""
-        row.model = str(payload.get("model") or "openrouter/free")
+        row.model = str(payload.get("model") or _environment_model(provider))
         row.fallback_models = fallback_models
         row.referer = str(payload.get("referer") or "")
         row.title = str(payload.get("title") or "Nexus AI")
@@ -173,7 +257,10 @@ def update_ai_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_provider_headers(config: Dict[str, Any]) -> Dict[str, str]:
-    headers: Dict[str, str] = {"Content-Type": "application/json", "Authorization": f"Bearer {config.get('api_key', '')}"}
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    api_key = str(config.get("api_key") or "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     if config.get("provider") == "openrouter":
         headers["HTTP-Referer"] = config.get("referer") or "https://nexus-ai.local"

@@ -20,9 +20,9 @@ interface StreamEvent {
 }
 
 const MODEL_OPTIONS = [
-  { value: "openrouter/free", label: "Auto · free-first" },
-  { value: "qwen/qwen3-coder:free", label: "Qwen Coder · free" },
-  { value: "google/gemma-4-31b-it:free", label: "Gemma · free" },
+  { value: "auto", label: "Auto · OmniRoute" },
+  { value: "auto/fast", label: "Auto · fast" },
+  { value: "auto/cheap", label: "Auto · economical" },
 ];
 
 function createId(prefix: string): string {

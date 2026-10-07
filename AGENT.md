@@ -35,7 +35,7 @@ Komponen kunci:
 - terminator data [DONE]
 4. Grill-Me diperlakukan sebagai diagnostic escalation, bukan default mode.
 5. Auto routing tetap policy-driven, bukan keyword if sederhana.
-6. Free-model-first tetap diprioritaskan untuk menghindari error billing 402.
+6. OmniRoute `auto`/configured routing menjadi provider utama; jangan meng-hardcode provider upstream di frontend. Fallback model mengikuti konfigurasi gateway dan tidak boleh memaksa model berbayar.
 7. Frontend proxy harus meneruskan pesan error backend secara transparan.
 8. Health indicator frontend harus tetap bisa membedakan online vs offline.
 

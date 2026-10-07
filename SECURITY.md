@@ -1,7 +1,8 @@
 # Security baseline
 
 - Configure a non-empty `ADMIN_PANEL_TOKEN` before exposing the service.
-- Configure `NEXUS_CONFIG_ENCRYPTION_KEY` before saving provider keys via the admin API.
+- Configure `NEXUS_CONFIG_ENCRYPTION_KEY` before saving OmniRoute/provider keys via the admin API.
+- Keep OmniRoute bound to a private interface or protect its endpoint key; Nexus should reach it server-side only.
 - Admin configuration responses never include the provider API key.
 - Set an explicit `CORS_ORIGINS`; wildcard origins are not accepted by the backend configuration.
 - Chat requests are rate-limited and have a body-size limit.

@@ -18,6 +18,7 @@ from logic.admin_settings import (
     ensure_default_ai_config,
     get_active_ai_config,
     get_mira_snapshot,
+    normalize_provider,
     update_ai_config,
 )
 from logic.agent_orchestrator import AgentOrchestrator
@@ -118,9 +119,7 @@ class ChatRequest(BaseModel):
     session_id: str = Field(
         default="default", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
     )
-    model: Optional[str] = Field(
-        default="google/gemma-3-27b-it:free", max_length=200
-    )
+    model: Optional[str] = Field(default="auto", max_length=200)
     images: List[str] = Field(default_factory=list, max_length=4)
     grill_mode: bool = False
 
@@ -262,8 +261,10 @@ def admin_mira(limit: int = 10, _: None = Depends(require_admin_access)):
 
 @app.get("/admin/models/{provider}")
 def admin_get_models(provider: str, _: None = Depends(require_admin_access)):
-    provider = provider.strip().lower()
-    if provider == "openrouter":
+    provider = normalize_provider(provider)
+    if provider == "omniroute":
+        models = ["auto", "auto/fast", "auto/cheap", "auto/best-free"]
+    elif provider == "openrouter":
         models = ai_service.fetch_free_models()
     elif provider == "alibaba":
         models = ["qwen-plus", "qwen-max", "qwen-3-next", "qwen-turbo", "qwen-long"]
@@ -419,18 +420,19 @@ async def chat_with_tools(req: ChatRequest):
             )
 
             active_config = get_active_ai_config() or {}
-            configured_model = str(active_config.get("model") or "").strip()
             incoming_model = str(req.model or "").strip()
-            generic_models = {"", "openrouter/free", "google/gemma-3-27b-it:free"}
-            if incoming_model in generic_models:
-                # A generic provider default should not suppress cognitive policy.
-                effective_model = (
-                    policy.preferred_model
-                    if not configured_model or configured_model in generic_models
-                    else configured_model
-                )
-            else:
-                effective_model = incoming_model
+            generic_models = {
+                "",
+                "auto",
+                "openrouter/free",
+                "google/gemma-3-27b-it:free",
+            }
+            requested_model = (
+                policy.preferred_model
+                if incoming_model in generic_models
+                else incoming_model
+            )
+            effective_model = ai_service.resolve_model(requested_model, active_config)
 
             effective_grill_mode = bool(policy.auto_grill_me)
             routing_metrics.log(
@@ -629,13 +631,8 @@ async def chat_endpoint(req: ChatRequest):
         system_prompt += f"\n\n[SESSION MEMORY - untrusted context]\n{context}"
 
     active_config = get_active_ai_config() or {}
-    configured_model = str(active_config.get("model") or "openrouter/free")
     requested_model = str(req.model or "")
-    model = (
-        configured_model
-        if requested_model in {"", "openrouter/free", "google/gemma-3-27b-it:free"}
-        else requested_model
-    )
+    model = ai_service.resolve_model(requested_model, active_config)
     response_text = ""
     for candidate in ai_service.get_fallback_chain(model)[:8]:
         response_text = await asyncio.to_thread(

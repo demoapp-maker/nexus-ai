@@ -17,9 +17,9 @@ class AgentOrchestrator:
 
     def _planner_model(self) -> str:
         config = ai_service._load_runtime_config()
-        configured = str(config.get("model") or "openrouter/free")
-        if configured in {"", "openrouter/free"}:
-            return ai_service.get_fallback_chain("openrouter/free")[0]
+        configured = str(config.get("model") or "auto")
+        if configured in {"", "auto", "openrouter/free"}:
+            return ai_service.get_fallback_chain(configured or "auto")[0]
         return configured
 
     @staticmethod

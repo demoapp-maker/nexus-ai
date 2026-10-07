@@ -2,7 +2,7 @@
 
 Nexus AI adalah asisten AI strategis berbasis FastAPI + Next.js. Backend memakai cognitive routing, policy-driven response modes, tool calling, web research, Grill-Me/TGM, dan memory per session.
 
-> Status: development/production-ready baseline. Provider AI tetap membutuhkan API key yang valid, kecuali menggunakan `NEXUS_MOCK_AI=true` untuk smoke test lokal.
+> Status: development/production-ready baseline. AI utama memakai OmniRoute melalui OpenAI-compatible API (`/v1/chat/completions`) dan model `auto`. Gunakan `NEXUS_MOCK_AI=true` untuk smoke test lokal tanpa gateway/provider.
 
 ## Arsitektur singkat
 
@@ -12,7 +12,7 @@ Browser
   ▼
 frontend (Next.js 16) ──► backend (FastAPI/SSE)
                               ├─ CognitiveRouter + PolicyEngine
-                              ├─ AIService (OpenRouter/Alibaba/DuckAI)
+                              ├─ AIService → OmniRoute (OpenAI-compatible /v1)
                               ├─ WebSearchTool (bounded public fetch)
                               ├─ Grill-Me v2
                               └─ SQLite memory per session
@@ -40,11 +40,31 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Isi OPENROUTER_API_KEY dan ADMIN_PANEL_TOKEN bila diperlukan
+# Jalankan OmniRoute secara terpisah, lalu isi OMNIROUTE_API_KEY bila endpoint memerlukannya.
+# Isi ADMIN_PANEL_TOKEN dan NEXUS_CONFIG_ENCRYPTION_KEY untuk admin credential.
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Jika `DATABASE_URL` kosong, backend otomatis memakai SQLite lokal di `backend/data/nexus_config.db`. Memory percakapan disimpan di `backend/data/nexus_memory.db`.
+
+### OmniRoute OpenAI-compatible gateway
+
+OmniRoute berjalan sebagai gateway terpisah pada default `http://127.0.0.1:20128/v1`. Instal dan jalankan:
+
+```bash
+npm install -g omniroute
+OMNIROUTE_SERVER_HOST=127.0.0.1 omniroute serve --no-open --no-tray
+```
+
+Dengan instalasi baru, model `auto` dapat digunakan melalui endpoint OpenAI-compatible:
+
+```bash
+curl http://127.0.0.1:20128/v1/chat/completions \\
+  -H 'Content-Type: application/json' \\
+  -d '{"model":"auto","messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+Konfigurasi Nexus menggunakan `OMNIROUTE_URL`, `OMNIROUTE_API_KEY` bila dashboard membuat key, dan `OMNIROUTE_MODEL=auto`. Nexus hanya mengirim request OpenAI chat-completions ke gateway; provider credential dan fallback antar-provider tetap dikelola OmniRoute.
 
 Untuk smoke test tanpa provider eksternal:
 
@@ -73,13 +93,14 @@ BACKEND_URL=http://127.0.0.1:8000 npm run start -- --hostname 0.0.0.0 --port 500
 ### 3. PM2
 
 ```bash
+./nexus.sh setup-omniroute  # user-local, default OmniRoute 3.8.51
 ./nexus.sh build
 ./nexus.sh start
 ./nexus.sh status
 ./nexus.sh logs
 ```
 
-Path PM2 dihitung relatif terhadap lokasi repo; tidak ada asumsi `/root/nexus-ai`.
+PM2 menjalankan `nexus-omniroute` pada loopback `127.0.0.1:20128`, lalu backend dan frontend. Path PM2 dihitung relatif terhadap lokasi repo; tidak ada asumsi `/root/nexus-ai`. Set `OMNIROUTE_HOME`, `OMNIROUTE_PORT`, atau `OMNIROUTE_ENTRY` untuk lokasi/port custom. Sebelum deployment, atur password dashboard OmniRoute yang kuat; jika gateway dibuka keluar loopback, wajib aktifkan API-key protection.
 
 ## Konfigurasi penting
 
@@ -92,9 +113,13 @@ Lihat `backend/.env.example`. Variable terpenting:
 - `NEXUS_CONFIG_ENCRYPTION_KEY` — Fernet key wajib jika API key disimpan melalui `/admin/config`.
 - `RATE_LIMIT_PER_MINUTE` dan `MAX_REQUEST_BODY_BYTES` — abuse protection.
 - `ENABLE_GLOBAL_MEMORY=false` — default untuk mencegah kebocoran lintas session.
+- `DEFAULT_AI_PROVIDER=omniroute` — provider utama; alias `openai-compatible` juga dinormalisasi ke OmniRoute.
+- `OMNIROUTE_URL=http://127.0.0.1:20128/v1` — root OpenAI-compatible OmniRoute; backend menambahkan `/chat/completions`.
+- `OMNIROUTE_API_KEY` — key endpoint OmniRoute bila konfigurasi gateway memerlukannya.
+- `OMNIROUTE_MODEL=auto` — biarkan OmniRoute memilih provider/model; dapat diganti `auto/fast`, `auto/cheap`, atau model route yang tersedia.
 - `NEXUS_MOCK_AI=false` — hanya untuk development/smoke test.
 
-API key tidak dikembalikan oleh endpoint admin; hanya status `api_key_set` yang ditampilkan.
+API key tidak dikembalikan oleh endpoint admin; hanya status `api_key_set` yang ditampilkan. Key yang disimpan melalui admin API dienkripsi dengan Fernet.
 
 ## Pengujian dan quality gate
 

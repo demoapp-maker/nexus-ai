@@ -1,28 +1,32 @@
+from __future__ import annotations
+
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config.database import engine, init_db
+from config.database import DATABASE_URL, engine, init_db
 from sqlalchemy import text
 
 
-def setup():
-    print("🚀 Initializing Local PostgreSQL for Nexus AI...")
+def setup() -> None:
+    print("Initializing the Nexus AI database...")
     try:
-        # Create tables
         init_db()
-        print("✅ Tables created successfully.")
-        
-        # Verify connection
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT current_database();"))
-            db_name = result.fetchone()[0]
-            print(f"✅ Connected to database: {db_name}")
-            
-    except Exception as e:
-        print(f"❌ Setup failed: {e}")
-        raise SystemExit(1) from e
+        print("Tables created successfully.")
+
+        with engine.connect() as connection:
+            if engine.dialect.name == "sqlite":
+                version = connection.execute(text("SELECT sqlite_version()"))
+                print(f"Connected to SQLite {version.scalar_one()}.")
+            else:
+                name = connection.execute(text("SELECT current_database()"))
+                print(f"Connected to database: {name.scalar_one()}.")
+        print(f"Database URL configured: {DATABASE_URL.split('@')[-1]}")
+    except Exception as exc:
+        print(f"Database setup failed: {exc}")
+        raise SystemExit(1) from exc
+
 
 if __name__ == "__main__":
     setup()

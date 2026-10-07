@@ -8,7 +8,7 @@ python3 -m venv /tmp/nexus-venv
 cd frontend && npm ci
 ```
 
-Use `NEXUS_MOCK_AI=true` when the provider is unavailable. This returns deterministic responses and does not call OpenRouter.
+AI runtime memakai OmniRoute melalui OpenAI-compatible API secara default (`http://127.0.0.1:20128/v1`, model `auto`). Jalankan `./nexus.sh setup-omniroute` untuk instalasi user-local atau install CLI secara global, dan bind gateway ke loopback. Use `NEXUS_MOCK_AI=true` when OmniRoute/provider is unavailable; this returns deterministic responses and does not call any external AI endpoint.
 
 ## Quality gates
 

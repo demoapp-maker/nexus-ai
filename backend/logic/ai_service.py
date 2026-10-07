@@ -12,7 +12,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import requests
-from logic.admin_settings import get_active_ai_config, get_provider_headers
+from logic.admin_settings import (
+    get_active_ai_config,
+    get_provider_headers,
+    normalize_provider,
+)
 
 _free_models_cache: List[str] = []
 _free_models_fetched_at: float = 0.0
@@ -21,7 +25,12 @@ _FREE_MODELS_TTL = 600
 
 class AIService:
     def __init__(self) -> None:
-        self.provider = os.getenv("DEFAULT_AI_PROVIDER", "openrouter").strip().lower()
+        self.provider = normalize_provider(os.getenv("DEFAULT_AI_PROVIDER", "omniroute"))
+        self.omniroute_url = os.getenv(
+            "OMNIROUTE_URL", "http://127.0.0.1:20128/v1/chat/completions"
+        )
+        self.omniroute_api_key = os.getenv("OMNIROUTE_API_KEY", "")
+        self.omniroute_model = os.getenv("OMNIROUTE_MODEL", "auto")
         self.duckai_url = os.getenv(
             "DUCKAI_URL", "http://localhost:3000/v1/chat/completions"
         )
@@ -60,7 +69,11 @@ class AIService:
         except Exception as exc:
             print(f"[AI-CONFIG] Falling back to environment config: {exc}")
 
-        if self.provider == "alibaba":
+        if self.provider == "omniroute":
+            base_url = self.omniroute_url
+            api_key = self.omniroute_api_key
+            model = self.omniroute_model
+        elif self.provider == "alibaba":
             base_url = self.alibaba_url
             api_key = self.alibaba_api_key
             model = os.getenv("ALIBABA_AI_MODEL", "qwen-plus")
@@ -68,10 +81,18 @@ class AIService:
             base_url = self.duckai_url
             api_key = self.duckai_api_key
             model = os.getenv("DUCKAI_MODEL", "gpt-4o-mini")
-        else:
+        elif self.provider == "openrouter":
             base_url = self.openrouter_url
             api_key = self.openrouter_api_key
             model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+        else:
+            base_url = os.getenv(
+                "OPENAI_COMPATIBLE_URL", self.omniroute_url
+            )
+            api_key = os.getenv(
+                "OPENAI_COMPATIBLE_API_KEY", self.omniroute_api_key
+            )
+            model = os.getenv("OPENAI_COMPATIBLE_MODEL", "auto")
 
         return {
             "provider": self.provider,
@@ -89,27 +110,62 @@ class AIService:
         self, runtime_config: Optional[Dict[str, object]] = None
     ) -> Tuple[str, str, str, Dict[str, str]]:
         config = runtime_config or self._load_runtime_config()
-        provider = str(config.get("provider") or self.provider).strip().lower()
-        if provider == "openrouter":
+        provider = normalize_provider(str(config.get("provider") or self.provider))
+        if provider == "omniroute":
+            default_url, default_key = self.omniroute_url, self.omniroute_api_key
+        elif provider == "openrouter":
             default_url, default_key = self.openrouter_url, self.openrouter_api_key
         elif provider == "alibaba":
             default_url, default_key = self.alibaba_url, self.alibaba_api_key
         elif provider == "duckai":
             default_url, default_key = self.duckai_url, self.duckai_api_key
         else:
-            default_url, default_key = self.openrouter_url, self.openrouter_api_key
+            default_url = os.getenv("OPENAI_COMPATIBLE_URL", self.omniroute_url)
+            default_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", self.omniroute_api_key)
 
         url = str(config.get("base_url") or default_url)
         api_key = str(config.get("api_key") or default_key)
         headers = dict(get_provider_headers(config))
-        headers["Authorization"] = f"Bearer {api_key}"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers.pop("Authorization", None)
         return url, api_key, provider, headers
+
+    def resolve_model(
+        self,
+        requested_model: Optional[str] = None,
+        runtime_config: Optional[Dict[str, object]] = None,
+    ) -> str:
+        """Resolve request/routing model names against the active gateway."""
+        config = runtime_config or self._load_runtime_config()
+        provider = normalize_provider(str(config.get("provider") or self.provider))
+        configured = str(config.get("model") or "").strip()
+        requested = str(requested_model or "").strip()
+        if provider == "omniroute":
+            configured = configured or self.omniroute_model or "auto"
+            # Cognitive routing historically emits OpenRouter free-model IDs.
+            # OmniRoute owns model selection, so those legacy IDs map to its
+            # configured model (normally auto or auto/fast).
+            if (
+                not requested
+                or requested in {"auto", "openrouter/free"}
+                or requested.startswith("openrouter/")
+                or requested.endswith(":free")
+            ):
+                return configured
+            return requested
+        if requested and requested not in {"", "auto", "openrouter/free"}:
+            return requested
+        if configured:
+            return configured
+        return requested or "openrouter/free"
 
     def fetch_free_models(self) -> List[str]:
         """Fetch and cache OpenRouter models with zero prompt/completion cost."""
         global _free_models_cache, _free_models_fetched_at
         runtime_config = self._load_runtime_config()
-        provider = str(runtime_config.get("provider") or self.provider).lower()
+        provider = normalize_provider(str(runtime_config.get("provider") or self.provider))
         api_key = str(runtime_config.get("api_key") or self.openrouter_api_key)
         now = time.time()
         if _free_models_cache and now - _free_models_fetched_at < _FREE_MODELS_TTL:
@@ -150,13 +206,15 @@ class AIService:
 
     def get_fallback_chain(self, primary_model: str) -> List[str]:
         config = self._load_runtime_config()
-        primary = str(primary_model or config.get("model") or "openrouter/free")
+        provider = normalize_provider(str(config.get("provider") or self.provider))
+        primary = self.resolve_model(primary_model, config)
         if self.mock_mode:
             return [primary]
         configured = config.get("fallback_models") or []
         if isinstance(configured, list) and configured:
-            configured_models = [str(item) for item in configured]
-            provider = str(config.get("provider") or self.provider).lower()
+            configured_models = [
+                self.resolve_model(str(item), config) for item in configured
+            ]
             allow_paid = os.getenv("ALLOW_PAID_MODELS", "false").lower() in {
                 "1", "true", "yes"
             }
@@ -167,7 +225,7 @@ class AIService:
                     if model.endswith(":free") or model.startswith("openrouter/")
                 ]
             candidates = [primary] + configured_models
-        elif str(config.get("provider") or self.provider).lower() == "openrouter":
+        elif provider == "openrouter":
             candidates = [primary] + self.fetch_free_models()
         else:
             candidates = [primary]
@@ -341,7 +399,7 @@ class AIService:
         prompt: str,
         history: Optional[List[Any]] = None,
         system_prompt: str = "You are Nexus AI, a helpful personal assistant.",
-        model: str = "openrouter/free",
+        model: str = "auto",
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = "auto",
         images: Optional[List[str]] = None,
@@ -352,6 +410,7 @@ class AIService:
 
         runtime_config = self._load_runtime_config()
         url, _, provider, headers = self._get_config(runtime_config)
+        model = self.resolve_model(model, runtime_config)
         messages = self._build_messages(
             prompt, history, system_prompt, provider, images
         )
@@ -453,7 +512,7 @@ class AIService:
         prompt: str,
         history: Optional[List[Any]] = None,
         system_prompt: str = "You are Nexus AI, a helpful personal assistant.",
-        model: str = "openrouter/free",
+        model: str = "auto",
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = "auto",
         images: Optional[List[str]] = None,
@@ -463,6 +522,7 @@ class AIService:
 
         runtime_config = self._load_runtime_config()
         url, _, provider, headers = self._get_config(runtime_config)
+        model = self.resolve_model(model, runtime_config)
         payload: Dict[str, Any] = {
             "model": model,
             "messages": self._build_messages(

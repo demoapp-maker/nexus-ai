@@ -41,14 +41,14 @@ class AIProviderConfig(Base):
     __tablename__ = "ai_provider_config"
 
     id = Column(Integer, primary_key=True, index=True)
-    provider = Column(Text, nullable=False, default="openrouter")
+    provider = Column(Text, nullable=False, default="omniroute")
     base_url = Column(
         Text,
         nullable=False,
-        default="https://openrouter.ai/api/v1/chat/completions",
+        default="http://127.0.0.1:20128/v1/chat/completions",
     )
     api_key = Column(Text, nullable=False, default="")
-    model = Column(Text, nullable=False, default="openrouter/free")
+    model = Column(Text, nullable=False, default="auto")
     fallback_models = Column(JSON, nullable=False, default=list)
     referer = Column(Text, nullable=True)
     title = Column(Text, nullable=True)
